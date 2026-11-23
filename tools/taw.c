@@ -32,8 +32,10 @@ static void usage(FILE *f)
 	    "\n"
 	    "  c   compress (.awseek output or -s gives the seekable variant)\n"
 	    "      -l 1..9          fitting effort (default 5)\n"
-	    "      -p auto|order0|mix  predictor (default auto: the fitted mixer\n"
-	    "                       if it beats order0)\n"
+	    "      -p auto|order0|mix|chunk\n"
+	    "                       predictor (default auto: the fitted mixer if it\n"
+	    "                       beats order0; chunk: the mixer with context\n"
+	    "                       models over chunks cut by a fitted routing table)\n"
 	    "      -w auto|f16|q8|q4|q2|fp8|nvfp4|iq8|iq4|iq2\n"
 	    "                       mixer weight format (default auto)\n"
 	    "      -j N             worker threads (default 1)\n"
@@ -121,7 +123,8 @@ static bool parse_u64(const char *s, uint64_t *v)
 }
 
 #if TAW_HAVE_ENCODER
-static const char *const predictors[] = {"auto", "order0", "mix", nullptr};
+static const char *const predictors[] = {"auto", "order0", "mix", "chunk",
+	nullptr};
 static const char *const weights[] = {"auto", "f16", "q8", "q4", "q2", "fp8",
 	"nvfp4", "iq8", "iq4", "iq2", nullptr};
 static const char *const gpus[] = {"off", "auto", "on", nullptr};
@@ -144,6 +147,7 @@ static const char *profile_name(unsigned p)
 	switch (p) {
 	case 0: return "INT_ORDER0";
 	case 1: return "F32_STRICT_MIX";
+	case 2: return "F32_STRICT_CHUNK";
 	default: return "?";
 	}
 }

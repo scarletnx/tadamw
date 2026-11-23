@@ -466,18 +466,24 @@ static bool make_pipeline(taw_gpu *g)
 	return true;
 }
 
+typedef struct {
+	const sample *sm;
+	uint8_t map[P1_NCTX];
+} sample_view;
+
 /* Samples in the shader's layout (see fit_gpu.comp). */
 static void fill_samples(void *ctx, void *dst, size_t off, size_t n)
 {
-	const sample *sm = ctx;
+	const sample_view *v = ctx;
+	const uint8_t *m = v->map;
 	uint32_t *o = dst;
 	const size_t first = off / (GPU_SW * 4), count = n / (GPU_SW * 4);
 	for (size_t i = 0; i < count; i++, o += GPU_SW) {
-		const sample *s = &sm[first + i];
+		const sample *s = &v->sm[first + i];
 		for (unsigned q = 0; q < 12; q++)
-			o[q] = (uint16_t)s->st[2 * q] |
-			    (uint32_t)(uint16_t)s->st[2 * q + 1] << 16;
-		o[12] = (uint16_t)s->st[24] | 256u << 16; /* bias input 1.0 */
+			o[q] = (uint16_t)s->st[m[2 * q]] |
+			    (uint32_t)(uint16_t)s->st[m[2 * q + 1]] << 16;
+		o[12] = (uint16_t)s->st[m[24]] | 256u << 16; /* bias input 1.0 */
 		o[13] = s->c0 | (uint32_t)s->c1 << 8 | (uint32_t)s->msel << 16 |
 		    (uint32_t)s->bit << 24;
 	}
@@ -515,13 +521,15 @@ void taw_gpu_close(taw_gpu *g)
 
 static_assert(GPU_SW * 4 * 1024 <= GPU_STAGE, "staging holds whole samples");
 
-taw_status taw_gpu_open(const sample *sm, size_t ns, bool debug,
-    taw_gpu **out)
+taw_status taw_gpu_open(const sample *sm, size_t ns, const p1_shape *s,
+    bool debug, taw_gpu **out)
 {
 	*out = nullptr;
 	taw_gpu *g = calloc(1, sizeof *g);
 	if (!g)
 		return TAW_E_NOMEM;
+	sample_view view = {.sm = sm};
+	fit_sample_map(s, view.map);
 	g->debug = debug;
 	g->ns = ns;
 	const uint64_t smp_bytes = (uint64_t)ns * GPU_SW * 4;
@@ -548,7 +556,7 @@ taw_status taw_gpu_open(const sample *sm, size_t ns, bool debug,
 	    !mkbuf(g, GPU_STAGE, true, &g->stage) ||
 	    !mkbuf(g, smp_bytes, false, &g->smp) ||
 	    !xfer(g, g->smp.b, true, nullptr, (size_t)smp_bytes, fill_samples,
-		(void *)sm))
+		&view))
 		goto fail;
 	if (debug)
 		fprintf(stderr, "taw fit: gpu: %s, %zu samples (%.0f MiB)\n",
@@ -766,11 +774,12 @@ taw_status taw_gpu_train(taw_gpu *g, tnet *nets, size_t k, int epochs,
 
 #else /* no GPU support in this build */
 
-taw_status taw_gpu_open(const sample *sm, size_t ns, bool debug,
-    taw_gpu **out)
+taw_status taw_gpu_open(const sample *sm, size_t ns, const p1_shape *s,
+    bool debug, taw_gpu **out)
 {
 	(void)sm;
 	(void)ns;
+	(void)s;
 	if (debug)
 		fprintf(stderr, "taw fit: gpu: not built (TADAMW_GPU=OFF)\n");
 	*out = nullptr;

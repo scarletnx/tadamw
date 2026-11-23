@@ -129,7 +129,7 @@ typedef struct {
 	uint8_t profile;
 	uint32_t c0;     /* partial byte with leading 1 bit, 1..255 */
 	uint16_t p[256]; /* profile 0 state */
-	struct taw_p1 *p1; /* profile 1 state (heap), else nullptr */
+	struct taw_p1 *p1; /* profile 1 or 2 state (heap), else nullptr */
 } taw_pred;
 
 /* Is (profile, quant) a pair this build can decode? */

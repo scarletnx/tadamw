@@ -82,6 +82,19 @@ int main(void)
 	free(s1);
 	free(s3);
 
+	/* profile 2: the nets of both lane sets are trained on the GPU */
+	p = (taw_params){.level = 3, .predictor = TAW_PREDICTOR_CHUNK,
+		.gpu = TAW_GPU_ON};
+	void *c_gpu, *c_cpu;
+	const size_t nc_gpu = pack(src, N, &p, &c_gpu);
+	p.gpu = TAW_GPU_OFF;
+	const size_t nc_cpu = pack(src, N, &p, &c_cpu);
+	fprintf(stderr, "profile 2, level 3: gpu %zu bytes, cpu %zu bytes\n",
+	    nc_gpu, nc_cpu);
+	CHECK(nc_gpu < nc_cpu + nc_cpu / 50);
+	free(c_gpu);
+	free(c_cpu);
+
 	free(src);
 	return CHECK_DONE();
 }

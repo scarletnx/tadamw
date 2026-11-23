@@ -83,6 +83,22 @@ if(NOT want STREQUAL got)
   message(FATAL_ERROR "profile 1 range extract mismatch")
 endif()
 
+# Profile 2 (the chunk stage), stream and seekable.
+run("${TAW}" c -l 2 -p chunk "${INPUT}" "${WORK}/in.chunk.aw")
+run("${TAW}" d "${WORK}/in.chunk.aw" "${WORK}/out.chunk.bin")
+same("${INPUT}" "${WORK}/out.chunk.bin")
+execute_process(COMMAND "${TAW}" i "${WORK}/in.chunk.aw" OUTPUT_VARIABLE info)
+if(NOT info MATCHES "profile: +2 \\(F32_STRICT_CHUNK\\)")
+  message(FATAL_ERROR "unexpected info output:\n${info}")
+endif()
+run("${TAW}" c -l 1 -p chunk -j 2 -B 16384 "${INPUT}" "${WORK}/chunk.awseek")
+run("${TAW}" x "${WORK}/chunk.awseek" 15000 5000 "${WORK}/chunk_range.bin")
+file(READ "${INPUT}" want OFFSET 15000 LIMIT 5000 HEX)
+file(READ "${WORK}/chunk_range.bin" got HEX)
+if(NOT want STREQUAL got)
+  message(FATAL_ERROR "profile 2 range extract mismatch")
+endif()
+
 # Bad option values are usage errors.
 execute_process(COMMAND "${TAW}" c -p bogus "${INPUT}" "${WORK}/bad.aw"
                 RESULT_VARIABLE rc ERROR_QUIET)

@@ -1,10 +1,15 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Arithmetic profile 1, F32_STRICT_MIX (docs/format.md §2.2, §5.1).
+/* Arithmetic profiles 1, F32_STRICT_MIX (docs/format.md §2.2, §5.1), and 2,
+ * F32_STRICT_CHUNK (§2.3, §5.2).
  *
  * Adaptive integer context models produce stretched bit probabilities; a
  * small frozen MLP (weights fitted offline by the encoder) mixes them into
- * one 16-bit probability. Everything here is shared by the decoder, the
- * encoder's coding pass, and the encoder's feature extraction for fitting.
+ * one 16-bit probability. Profile 2 is profile 1 with a chunk stage: a
+ * routing table fitted to the input cuts the bytes into chunks and lines,
+ * four more context models are keyed by them, and the model names which
+ * ten of the fourteen hashed models run. Everything here is shared by the
+ * decoder, the encoder's coding pass, and the encoder's feature extraction
+ * for fitting.
  */
 #ifndef TAW_P1_H
 #define TAW_P1_H
@@ -21,6 +26,13 @@ enum {
 	P1_NCTX = 25,    /* context-model inputs: 2 per model + match */
 	P1_F = 26,       /* mixer inputs: P1_NCTX + bias */
 	P1_NHASH = 10,   /* hashed context models (all but o0, o1) */
+	P2_NCAND = 14,   /* profile 2: the hashed models P1_NHASH are chosen
+	                    from: profile 1's ten and four of the chunk stage */
+	P2_NCLASS = 16,  /* byte classes of its routing table */
+	P2_ROUTE_BYTES = 128 + 4 * P2_NCLASS, /* the table's size in the model */
+	P2_LINE_MAX = 128, /* chunks of a line that are remembered */
+	P1_NCM_ALL = 2 + P2_NCAND,      /* the encoder runs every candidate */
+	P1_NCTX_ALL = 2 * P1_NCM_ALL + 1,
 	P1_HMAX = 32,    /* max hidden units */
 	P1_MODEL_HEAD = 8,
 	P1_MINLEN = 5,   /* match model: minimum verified length */
@@ -36,6 +48,18 @@ enum {
 	P1_CM_S23, P1_CM_WORD, P1_CM_S34, P1_CM_S24, P1_CM_S14, P1_CM_S1278
 };
 enum { P1_IN_MATCH = 2 * P1_NCM, P1_IN_BIAS };
+
+/* Hashed context models by id (format.md §2.3.3): profile 1's are 0..9 in
+ * its lane order, the chunk stage's follow. Each is the chunk so far with
+ * something else: PREV the chunk before it, COL its place in the line,
+ * SKIP the chunk two back, ABOVE the chunk at the same place in the line
+ * before. */
+enum {
+	P2_CX_O2, P2_CX_O3, P2_CX_O4, P2_CX_O6, P2_CX_S23, P2_CX_WORD,
+	P2_CX_S34, P2_CX_S24, P2_CX_S14, P2_CX_S1278,
+	P2_CX_PREV, P2_CX_COL, P2_CX_SKIP, P2_CX_ABOVE
+};
+static_assert(P2_CX_ABOVE + 1 == P2_NCAND, "context ids");
 
 /* Weight-set selectors. */
 enum {
@@ -61,13 +85,123 @@ enum {
 	P1_MATCH_MIN = 10, P1_MATCH_MAX = 24,
 };
 
+/* Profile 2's routing table (format.md §2.3.1): byte b starts a new chunk
+ * after byte a when bit cls[b] of row[cls[a]] is set, and that chunk also
+ * starts a new line when the same bit of row2 is set. */
+typedef struct {
+	uint8_t cls[256];           /* byte -> class, 0..P2_NCLASS-1 */
+	uint16_t row[P2_NCLASS];
+	uint16_t row2[P2_NCLASS];
+} p2_route;
+
+/* 0 no boundary, 1 a chunk boundary, 3 one that also starts a line. */
+static inline unsigned p2_boundary(const p2_route *r, uint32_t a, uint32_t b)
+{
+	const unsigned ca = r->cls[a], cb = r->cls[b];
+	const unsigned b1 = r->row[ca] >> cb & 1;
+	return b1 | (b1 & (r->row2[ca] >> cb)) << 1;
+}
+
+/* Profile 2's chunk state (format.md §2.3.2). */
+typedef struct {
+	uint32_t ck[3]; /* hashes of the chunk so far, the chunk before it
+	                   and the one before that */
+	uint32_t idx;   /* chunks closed in this line, at most P2_LINE_MAX */
+	uint32_t cl;    /* which of line[2] is the current line */
+	uint32_t ab;    /* the chunk at idx in the line before, or 0 */
+	bool open;      /* a byte was seen: false only at a unit's start */
+	bool cut;       /* the last byte closed a chunk */
+} p2_chunk;
+
+/* The chunk state after byte ch, which follows byte prev: a boundary
+ * closes the chunk before ch joins the new one (the first byte of a unit
+ * has no chunk to close). line holds the closed chunks of the current
+ * line (line[k->cl]) and of the one before; the chunk closed here is
+ * entered by p2_chunk_commit. */
+static inline void p2_chunk_next(const p2_route *r, const p2_chunk *k,
+    const uint32_t line[2][P2_LINE_MAX], uint32_t prev, uint32_t ch,
+    p2_chunk *out)
+{
+	*out = *k;
+	const unsigned b = k->open ? p2_boundary(r, prev, ch) : 0;
+	out->open = true;
+	out->cut = b != 0;
+	if (b) {
+		out->ck[2] = k->ck[1];
+		out->ck[1] = k->ck[0];
+		out->ck[0] = 0;
+		if (b & 2) {
+			/* The line that closes is the one before from now on;
+			 * its first chunk may be the one closing with it. */
+			out->cl = k->cl ^ 1;
+			out->idx = 0;
+			out->ab = k->idx == 0 ? k->ck[0] : line[k->cl][0];
+		} else {
+			out->idx = k->idx < P2_LINE_MAX ? k->idx + 1 : P2_LINE_MAX;
+			out->ab = out->idx < P2_LINE_MAX ?
+			    line[k->cl ^ 1][out->idx] : 0;
+		}
+	}
+	out->ck[0] = (out->ck[0] ^ (ch + 1)) * 0x01000193u;
+}
+
+/* Make *next the chunk state; a chunk it closed goes into its line. */
+static inline void p2_chunk_commit(p2_chunk *k,
+    uint32_t line[2][P2_LINE_MAX], const p2_chunk *next)
+{
+	if (next->cut && k->idx < P2_LINE_MAX)
+		line[k->cl][k->idx] = k->ck[0];
+	*k = *next;
+}
+
+/* The hash arguments (a, b) of the four chunk contexts, in id order; their
+ * byte hashes are H(a, b, 15 + j) (format.md §2.3.3). */
+static inline void p2_chunk_args(const p2_chunk *k, uint32_t ab[8])
+{
+	const uint32_t col = (k->idx + 1) * 0x9E3779B1u;
+	ab[0] = k->ck[0];
+	ab[1] = k->ck[1];
+	ab[2] = k->ck[0];
+	ab[3] = col;
+	ab[4] = k->ck[0];
+	ab[5] = k->ck[2];
+	ab[6] = k->ck[0];
+	ab[7] = k->ab + col;
+}
+
+/* H(a, b, k) of format.md §2.2.4. */
+static inline uint32_t p1_hash3(uint32_t a, uint32_t b, uint32_t k)
+{
+	uint32_t x = a * 0x9E3779B1u + b * 0x85EBCA77u + k * 0xC2B2AE3Du;
+	x ^= x >> 15;
+	x *= 0x2C1B3C6Du;
+	x ^= x >> 12;
+	x *= 0x297A2D39u;
+	x ^= x >> 15;
+	return x;
+}
+
 typedef struct {
 	uint8_t lines_log2; /* hashed-table lines per context, log2 */
 	uint8_t hist_log2;  /* match history ring, log2 bytes */
 	uint8_t match_log2; /* match hash table entries, log2 */
 	uint8_t sel1, sel2; /* selectors for layer 1 / output layer */
 	uint8_t hidden;     /* hidden units, 0..P1_HMAX (0 = single layer) */
+	/* Profile 2 only (all zero in profile 1): */
+	bool chunk;         /* the model section is profile 2's */
+	bool all;           /* encoder: run all P2_NCAND hashed models, in id
+	                       order (lane is not used) */
+	uint8_t lane[P1_NHASH]; /* the context id of each hashed lane,
+	                           increasing */
+	p2_route route;     /* used when p2_shape_routes() */
 } p1_shape;
+
+/* Whether a profile 2 shape runs the chunk stage: any of its lanes holds
+ * a chunk context (then its model section carries the routing table). */
+static inline bool p2_shape_routes(const p1_shape *s)
+{
+	return s->chunk && (s->all || s->lane[P1_NHASH - 1] >= P2_CX_PREV);
+}
 
 /* ---- squash / stretch (integer, normative) ------------------------------ */
 
@@ -97,19 +231,25 @@ typedef struct {
 	alignas(32) uint32_t si[16];  /* arena index of each model's slot */
 	alignas(32) uint32_t lb[16];  /* arena index of each hashed model's line */
 	uint32_t c0, bitpos, nib, c4, c8, word, pos;
+	p2_chunk ch;                   /* profile 2: the chunk stage */
+	uint32_t line[2][P2_LINE_MAX]; /* its closed chunks, by line */
 	uint32_t mptr, mlen, msi;
 	int mexp;   /* expected byte, or -1 */
 	int mbit;   /* expected bit for the current bit, or -1 */
 	bool avx2;  /* use the AVX2 context kernels */
+	bool routes; /* profile 2 with the chunk stage running */
+	bool picks;  /* profile 2: hashed lane k runs context lane[k] */
 	/* geometry */
+	unsigned ncm, nhash; /* context models (P1_NCM, or P1_NCM_ALL in the
+	                        encoder's feature pass); the hashed ones */
 	unsigned lines_log2;
 	uint32_t hist_mask, match_mask;
 	/* tables; slots are stored XOR P1_SLOT_INIT so that zero = initial */
-	uint32_t *arena; /* [O0 256][O1 65536][T_k: 2^L x 16] */
+	uint32_t *arena; /* [O0 256][O1 65536][T_k: 2^L x 16], k = 2..ncm-1 */
 	size_t arena_n;
 	uint32_t *mtab, sm[16];
 	uint8_t *hist;
-	alignas(32) uint32_t hmap[P1_NCM * 256]; /* history maps, [k][h] */
+	alignas(32) uint32_t hmap[16 * 256]; /* history maps, [k][h] */
 	alignas(32) uint32_t hash[16]; /* byte hashes g_k, padded */
 	/* One bit before a nibble or byte boundary, the hashes of both
 	 * outcomes are computed and their lines prefetched; the boundary
@@ -117,6 +257,9 @@ typedef struct {
 	alignas(32) uint32_t spec_g[2][16];  /* byte hashes after the byte */
 	alignas(32) uint32_t spec_hh[2][16]; /* line hashes at the boundary */
 	uint32_t spec_mi[2];                 /* match-table index */
+	p2_chunk spec_ch[2];                 /* chunk state after the byte */
+	alignas(32) int32_t lane[16];        /* context id per hashed lane */
+	p2_route route;
 	/* Line tags are (hash & 0xFFFF) | epoch << 16; a reset starts a new
 	 * epoch instead of clearing the hashed tables. */
 	uint32_t epoch;
@@ -127,19 +270,27 @@ enum { P1_EPOCH_MAX = 0x7FFF };
 taw_status p1_ctx_init(p1_ctx *c, const p1_shape *s);
 void p1_ctx_reset(p1_ctx *c);
 void p1_ctx_free(p1_ctx *c);
-/* Mixer inputs x[0..P1_NCTX-1] = stretch / 256 (exact) and the selector
- * context for the next bit. x[P1_IN_BIAS] is left to the caller. */
+/* Mixer inputs x[0..2 ncm] = stretch / 256 (exact): model k's direct
+ * estimate at k, its history estimate at ncm + k, the match model at
+ * 2 ncm; and the selector context for the next bit. x has P1_XPAD
+ * entries (P1_XALL with P1_NCM_ALL models); the bias x[2 ncm + 1] and the
+ * padding after it are left to the caller (the kernels may leave anything
+ * there). */
 void p1_ctx_inputs(p1_ctx *c, float *x, p1_sel_ctx *sc);
 void p1_ctx_update(p1_ctx *c, int bit);
 
-/* AVX2 kernels for the 12 context models (p1_avx2.c); identical results
+/* AVX2 kernels for the context models (p1_avx2.c); identical results
  * to the scalar code in p1_ctx.c. */
 void p1_cm_inputs_avx2(p1_ctx *c, float *x);
 void p1_cm_update_avx2(p1_ctx *c, int bit);
-/* Byte hashes g[0..9] from the history; line hashes hh = H(g, q, 0).
- * g and hh are 16 aligned lanes. */
+/* Byte hashes g[0..9] from the history, and g[10..13] = H(ab[2j],
+ * ab[2j + 1], 15 + j) for profile 2's chunk contexts; line hashes
+ * hh = H(g, q, 0). g and hh are 16 aligned lanes. */
 void p1_byte_hashes_avx2(uint32_t c4, uint32_t c8, uint32_t word,
-    uint32_t *g);
+    const uint32_t ab[8], uint32_t *g);
+/* out[k] = g[lane[k]] for 16 lanes. */
+void p2_pick_lanes_avx2(const uint32_t *g, const int32_t *lane,
+    uint32_t *out);
 void p1_line_hashes_avx2(const uint32_t *g, uint32_t q, uint32_t *hh);
 /* Line selection for hh (tag check, reset on mismatch) and prefetch. */
 void p1_lines_apply_avx2(p1_ctx *c, const uint32_t *hh);
@@ -162,8 +313,9 @@ static inline uint32_t p1_sel_value(unsigned sel, const p1_sel_ctx *sc)
 /* ---- the frozen network -------------------------------------------------- */
 
 /* Mixer input vectors are P1_XPAD floats: x[0..P1_F-1] then zeros, so
- * that SIMD kernels may read whole vectors. */
-enum { P1_XPAD = 32 };
+ * that SIMD kernels may read whole vectors. p1_ctx_inputs needs P1_XALL:
+ * with P1_NCM_ALL models it writes P1_NCTX_ALL inputs. */
+enum { P1_XPAD = 32, P1_XALL = 40 };
 
 typedef struct p1_net p1_net;
 struct p1_net {
@@ -182,9 +334,10 @@ struct p1_net {
 uint64_t p1_weights_size(const p1_shape *s, uint8_t quant);
 bool p1_quant_supported(uint8_t quant);
 
-/* Parse a model section (header + weights) and dequantize it. */
-taw_status p1_net_load(p1_net *n, uint8_t quant, const uint8_t *model,
-    size_t size);
+/* Parse a model section (head, profile 2's lanes and routing table,
+ * weights) and dequantize it. chunk: the section is profile 2's. */
+taw_status p1_net_load(p1_net *n, bool chunk, uint8_t quant,
+    const uint8_t *model, size_t size);
 void p1_net_free(p1_net *n);
 /* Stretch-domain output, [-2047, 2047]. x has P1_XPAD entries,
  * x[P1_IN_BIAS] = 1 and x[P1_F..] = 0. */
@@ -244,6 +397,17 @@ void p1_skip_avx2(struct taw_p1 *m, const uint8_t *src, size_t n);
 /* Write the 8-byte model head. */
 void p1_head_write(uint8_t out[P1_MODEL_HEAD], const p1_shape *s);
 taw_status p1_head_parse(const uint8_t *p, size_t n, p1_shape *s);
+/* Bytes of a model section before the weights: the head and, in profile
+ * 2, the lanes and the routing table when a lane needs it (format.md
+ * §5.2). */
+enum { P2_HEAD_MAX = P1_MODEL_HEAD + P1_NHASH + P2_ROUTE_BYTES };
+static inline size_t p1_head_size(const p1_shape *s)
+{
+	return !s->chunk ? P1_MODEL_HEAD : P1_MODEL_HEAD + P1_NHASH +
+	    (p2_shape_routes(s) ? P2_ROUTE_BYTES : 0);
+}
+/* Write a profile 2 section's head (p1_head_size bytes). */
+void p2_head_write(uint8_t *out, const p1_shape *s);
 
 /* ---- encoder: fitting and model choice (fit.c) --------------------------- */
 
@@ -254,8 +418,9 @@ typedef struct {
 } taw_model_choice;
 
 /* Choose a profile and fit a model for src. unit = coding-unit size (n for
- * .aw, block_size for .awseek). Falls back to profile 0 when profile 1 is
- * not possible inside the budget. */
+ * .aw, block_size for .awseek). With predictor AUTO it gives profile 0 when
+ * profile 1 is not possible inside the budget; MIX and CHUNK then fail with
+ * TAW_E_ARG. */
 taw_status taw_model_fit(const uint8_t *src, size_t n, size_t unit,
     const taw_params *p, taw_model_choice *out);
 /* The same over any source (read_at may be called from several threads),

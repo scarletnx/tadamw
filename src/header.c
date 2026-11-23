@@ -73,7 +73,7 @@ taw_status taw_params_resolve(const taw_params *in, taw_params *out)
 		out->level = TAW_LEVEL_DEFAULT;
 	if (out->level < TAW_LEVEL_MIN || out->level > TAW_LEVEL_MAX)
 		return TAW_E_ARG;
-	if ((unsigned)out->predictor > TAW_PREDICTOR_MIX ||
+	if ((unsigned)out->predictor > TAW_PREDICTOR_CHUNK ||
 	    (unsigned)out->weights > TAW_WEIGHTS_IQ2)
 		return TAW_E_ARG;
 	if ((unsigned)out->gpu > TAW_GPU_ON)

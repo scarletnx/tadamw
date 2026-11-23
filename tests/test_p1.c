@@ -8,6 +8,7 @@
 #include "format.h"
 #include "half.h"
 #include "header.h"
+#include "old_p1_archive.h"
 #include "p1.h"
 #include "quant.h"
 #include "taw_internal.h"
@@ -173,13 +174,13 @@ static void parity_one(const model_spec *m)
 	taw_buf mb = build_model(m);
 	p1_net ref;
 	p1_isa_force(P1_ISA_SCALAR);
-	REQUIRE(p1_net_load(&ref, m->quant, mb.p, mb.n) == TAW_OK);
+	REQUIRE(p1_net_load(&ref, m->s.chunk, m->quant, mb.p, mb.n) == TAW_OK);
 	for (int isa = P1_ISA_AVX2; isa < P1_ISA_COUNT; isa++) {
 		if (!p1_isa_available((p1_isa)isa))
 			continue;
 		p1_isa_force(isa);
 		p1_net net;
-		REQUIRE(p1_net_load(&net, m->quant, mb.p, mb.n) == TAW_OK);
+		REQUIRE(p1_net_load(&net, m->s.chunk, m->quant, mb.p, mb.n) == TAW_OK);
 		uint64_t r = m->seed ^ 0x55;
 		int bad = 0;
 		for (int k = 0; k < 20000; k++) {
@@ -478,6 +479,30 @@ static void golden(void)
 	p1_isa_force(-1);
 }
 
+/* An archive from before profile 2 decodes to the same bytes on every
+ * ISA: the profile 1 format did not move. */
+static void old_archive(void)
+{
+	uint8_t want[OLD_P1_RAW_SIZE];
+	td_fill(want, sizeof want, TD_TEXT, 5);
+	taw_info info;
+	REQUIRE(taw_read_info(old_p1_archive, sizeof old_p1_archive, &info) ==
+	    TAW_OK);
+	CHECK(info.arith_profile == TAW_PROFILE_F32_STRICT_MIX);
+	for (int isa = 0; isa < P1_ISA_COUNT; isa++) {
+		if (!p1_isa_available((p1_isa)isa))
+			continue;
+		p1_isa_force(isa);
+		void *dec = nullptr;
+		size_t dec_n = 0;
+		CHECK(taw_decompress(old_p1_archive, sizeof old_p1_archive, &dec,
+		    &dec_n) == TAW_OK);
+		CHECK(dec_n == sizeof want && memcmp(dec, want, dec_n) == 0);
+		free(dec);
+	}
+	p1_isa_force(-1);
+}
+
 int main(void)
 {
 	tables();
@@ -488,5 +513,6 @@ int main(void)
 	golden();
 	archive_parity();
 	archive_model_damage();
+	old_archive();
 	return CHECK_DONE();
 }

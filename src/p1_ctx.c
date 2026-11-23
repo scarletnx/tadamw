@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Profile 1 context models and the integer squash/stretch (format.md §5.1). */
+/* Context models of profiles 1 and 2 and the integer squash/stretch
+ * (format.md §2.2, §2.3). */
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -124,22 +125,9 @@ static inline void hm_update(uint32_t *s, int bit, uint32_t limit)
 	*s = (p << 10 | n) ^ 0x80000000u;
 }
 
-/* ---- hashing -------------------------------------------------------------- */
-
-static inline uint32_t hash3(uint32_t a, uint32_t b, uint32_t k)
-{
-	uint32_t x = a * 0x9E3779B1u + b * 0x85EBCA77u + k * 0xC2B2AE3Du;
-	x ^= x >> 15;
-	x *= 0x2C1B3C6Du;
-	x ^= x >> 12;
-	x *= 0x297A2D39u;
-	x ^= x >> 15;
-	return x;
-}
-
 /* ---- context state ---------------------------------------------------------
  * Data layout: every context table lives in one arena of u32 slots,
- * [O0: 256][O1: 65536][T_2 .. T_11: 2^L lines of 16 each], and the per-bit
+ * [O0: 256][O1: 65536][T_2 .. T_(ncm-1): 2^L lines of 16 each], and the per-bit
  * hot state is a set of small parallel arrays (line bases, slot indices,
  * slot values, history-map indices) that the scalar loops and the AVX2
  * kernels both walk. (Computing the next nibble's hashes a bit early for
@@ -153,10 +141,18 @@ taw_status p1_ctx_init(p1_ctx *c, const p1_shape *s)
 	p1_tables_init();
 	memset(c, 0, sizeof *c);
 	c->avx2 = p1_isa_current() >= P1_ISA_AVX2;
+	c->ncm = s->chunk && s->all ? P1_NCM_ALL : P1_NCM;
+	c->nhash = c->ncm - 2;
+	c->routes = p2_shape_routes(s);
+	c->picks = s->chunk && !s->all;
+	for (unsigned k = 0; k < P1_NHASH; k++)
+		c->lane[k] = s->lane[k];
+	if (c->routes)
+		c->route = s->route;
 	c->lines_log2 = s->lines_log2;
 	c->hist_mask = (1u << s->hist_log2) - 1;
 	c->match_mask = (1u << s->match_log2) - 1;
-	c->arena_n = ARENA_HX + ((size_t)P1_NHASH << (s->lines_log2 + 4));
+	c->arena_n = ARENA_HX + ((size_t)c->nhash << (s->lines_log2 + 4));
 	/* Fresh anonymous memory is zero, and pages a unit never touches are
 	 * never faulted in (the tables are sized for the coding unit, so many
 	 * lines stay unused). */
@@ -188,28 +184,42 @@ void p1_ctx_free(p1_ctx *c)
 	memset(c, 0, sizeof *c);
 }
 
-/* g[k] = H(a_k, b_k, kk_k) for the hashed models O2..S1278, given the
- * history after a byte (format.md §2.2.4). */
+/* g[k] = H(a, b, kk) of the context in hashed lane k, given the history
+ * after a byte (format.md §2.2.4) and, in profile 2, the chunk state
+ * (§2.3.3). */
 static void byte_hashes_for(const p1_ctx *c, uint32_t c4, uint32_t c8,
-    uint32_t word, uint32_t *g)
+    uint32_t word, const p2_chunk *ch, uint32_t *g)
 {
+	uint32_t ab[8] = {0};
+	if (c->routes)
+		p2_chunk_args(ch, ab);
 #if TAW_X86_SIMD
 	if (c->avx2) {
-		p1_byte_hashes_avx2(c4, c8, word, g);
+		if (c->picks) {
+			alignas(32) uint32_t all[16];
+			p1_byte_hashes_avx2(c4, c8, word, ab, all);
+			p2_pick_lanes_avx2(all, c->lane, g);
+		} else {
+			p1_byte_hashes_avx2(c4, c8, word, ab, g);
+		}
 		return;
 	}
 #endif
-	(void)c;
-	g[0] = hash3(c4 & 0xFFFF, 0, 2);
-	g[1] = hash3(c4 & 0xFFFFFF, 0, 3);
-	g[2] = hash3(c4, 0, 4);
-	g[3] = hash3(c4, c8 & 0xFFFF, 6);
-	g[4] = hash3((c4 >> 8) & 0xFFFF, 0, 8);
-	g[5] = hash3(word, c4 & 0xFF, 9);
-	g[6] = hash3(c4 & 0xFFFF0000u, 0, 11);
-	g[7] = hash3(c4 & 0xFF00FF00u, 0, 12);
-	g[8] = hash3(c4 & 0xFF0000FFu, 0, 13);
-	g[9] = hash3(c4 & 0xFFFF, c8 & 0xFFFF0000u, 14);
+	uint32_t all[P2_NCAND];
+	all[P2_CX_O2] = p1_hash3(c4 & 0xFFFF, 0, 2);
+	all[P2_CX_O3] = p1_hash3(c4 & 0xFFFFFF, 0, 3);
+	all[P2_CX_O4] = p1_hash3(c4, 0, 4);
+	all[P2_CX_O6] = p1_hash3(c4, c8 & 0xFFFF, 6);
+	all[P2_CX_S23] = p1_hash3((c4 >> 8) & 0xFFFF, 0, 8);
+	all[P2_CX_WORD] = p1_hash3(word, c4 & 0xFF, 9);
+	all[P2_CX_S34] = p1_hash3(c4 & 0xFFFF0000u, 0, 11);
+	all[P2_CX_S24] = p1_hash3(c4 & 0xFF00FF00u, 0, 12);
+	all[P2_CX_S14] = p1_hash3(c4 & 0xFF0000FFu, 0, 13);
+	all[P2_CX_S1278] = p1_hash3(c4 & 0xFFFF, c8 & 0xFFFF0000u, 14);
+	for (unsigned j = 0; j < 4; j++)
+		all[P2_CX_PREV + j] = p1_hash3(ab[2 * j], ab[2 * j + 1], 15 + j);
+	for (unsigned k = 0; k < c->nhash; k++)
+		g[k] = all[c->picks ? (unsigned)c->lane[k] : k];
 }
 
 /* hh[k] = H(g[k], q, 0): the line hash for a nibble (q = 0 at bit 0, the
@@ -223,8 +233,8 @@ static void line_hashes(const p1_ctx *c, const uint32_t *g, uint32_t q,
 	} else
 #endif
 	{
-		for (unsigned k = 0; k < P1_NHASH; k++)
-			hh[k] = hash3(g[k], q, 0);
+		for (unsigned k = 0; k < c->nhash; k++)
+			hh[k] = p1_hash3(g[k], q, 0);
 	}
 }
 
@@ -238,7 +248,7 @@ static void lines_apply(p1_ctx *c, const uint32_t *hh)
 	}
 #endif
 	const unsigned sh = 32 - c->lines_log2;
-	for (unsigned k = 0; k < P1_NHASH; k++) {
+	for (unsigned k = 0; k < c->nhash; k++) {
 		uint32_t lb = ARENA_HX +
 		    (uint32_t)(((k << c->lines_log2) + (hh[k] >> sh)) * 16);
 		uint32_t tag = (hh[k] & 0xFFFFu) | c->epoch << 16;
@@ -261,7 +271,7 @@ static inline void lines_prefetch(const p1_ctx *c, const uint32_t *hh)
 	}
 #endif
 	const unsigned sh = 32 - c->lines_log2;
-	for (unsigned k = 0; k < P1_NHASH; k++)
+	for (unsigned k = 0; k < c->nhash; k++)
 		__builtin_prefetch(c->arena + ARENA_HX +
 		    (((size_t)k << c->lines_log2) + (hh[k] >> sh)) * 16, 1);
 }
@@ -273,7 +283,7 @@ static inline uint32_t word_next(uint32_t word, uint32_t ch)
 
 static inline uint32_t match_index(const p1_ctx *c, uint32_t c4, uint32_t c8)
 {
-	return hash3(c4, c8 & 0xFF, 10) & c->match_mask;
+	return p1_hash3(c4, c8 & 0xFF, 10) & c->match_mask;
 }
 
 void p1_ctx_reset(p1_ctx *c)
@@ -298,10 +308,12 @@ void p1_ctx_reset(p1_ctx *c)
 	c->nib = 1;
 	c->bitpos = 0;
 	c->c4 = c->c8 = c->word = c->pos = 0;
+	c->ch = (p2_chunk){0};
+	memset(c->line, 0, sizeof c->line);
 	c->mptr = c->mlen = 0;
 	c->mexp = -1;
 	alignas(32) uint32_t hh[16];
-	byte_hashes_for(c, 0, 0, 0, c->hash);
+	byte_hashes_for(c, 0, 0, 0, &c->ch, c->hash);
 	line_hashes(c, c->hash, 0, hh);
 	lines_apply(c, hh);
 }
@@ -318,18 +330,20 @@ void p1_ctx_inputs(p1_ctx *c, float *x, p1_sel_ctx *sc)
 		uint32_t *si = c->si;
 		si[P1_CM_O0] = c0;
 		si[P1_CM_O1] = ARENA_O1 + ((c->c4 & 0xFF) << 8 | c0);
-		for (unsigned k = P1_CM_O2; k < P1_NCM; k++)
+		const unsigned ncm = c->ncm;
+		for (unsigned k = P1_CM_O2; k < ncm; k++)
 			si[k] = c->lb[k] + nib;
-		for (unsigned k = 0; k < P1_NCM; k++)
+		for (unsigned k = 0; k < ncm; k++)
 			c->val[k] = c->arena[si[k]];
-		for (unsigned k = 0; k < P1_NCM; k++) {
+		for (unsigned k = 0; k < ncm; k++) {
 			const uint32_t v = c->val[k];
 			c->hmi[k] = k * 256 + slot_hist(v);
 			x[k] = (float)p1_stretch_tab[slot_ps12(v)] * (1.0f / 256.0f);
-			x[P1_NCM + k] = (float)p1_stretch_tab[hm_p12(c->hmap[c->hmi[k]])] *
+			x[ncm + k] = (float)p1_stretch_tab[hm_p12(c->hmap[c->hmi[k]])] *
 			    (1.0f / 256.0f);
 		}
 	}
+	const unsigned in_match = 2 * c->ncm;
 
 	uint32_t msel = 0;
 	c->mbit = -1;
@@ -339,10 +353,10 @@ void p1_ctx_inputs(p1_ctx *c, float *x, p1_sel_ctx *sc)
 		msel = lg - 1 < 7 ? lg - 1 : 7;
 		c->mbit = (c->mexp >> (7 - c->bitpos)) & 1;
 		c->msi = msel * 2 + (uint32_t)c->mbit;
-		x[P1_IN_MATCH] = (float)p1_stretch_tab[slot_ps12(c->sm[c->msi])] *
+		x[in_match] = (float)p1_stretch_tab[slot_ps12(c->sm[c->msi])] *
 		    (1.0f / 256.0f);
 	} else {
-		x[P1_IN_MATCH] = 0.0f;
+		x[in_match] = 0.0f;
 	}
 	*sc = (p1_sel_ctx){
 		.bitpos = (uint8_t)c->bitpos,
@@ -393,6 +407,8 @@ static void byte_end(p1_ctx *c)
 	c->nib = 1;
 	c->bitpos = 0;
 	memcpy(c->hash, c->spec_g[b], sizeof c->hash);
+	if (c->routes)
+		p2_chunk_commit(&c->ch, c->line, &c->spec_ch[b]);
 	lines_apply(c, c->spec_hh[b]);
 	c->mexp = c->mlen ? c->hist[c->mptr & c->hist_mask] : -1;
 }
@@ -414,7 +430,11 @@ static void speculate_byte(p1_ctx *c)
 		const uint32_t ch = (c->c0 << 1 | b) & 0xFF;
 		const uint32_t c8 = c->c8 << 8 | c->c4 >> 24;
 		const uint32_t c4 = c->c4 << 8 | ch;
-		byte_hashes_for(c, c4, c8, word_next(c->word, ch), c->spec_g[b]);
+		if (c->routes)
+			p2_chunk_next(&c->route, &c->ch, c->line, c->c4 & 0xFF, ch,
+			    &c->spec_ch[b]);
+		byte_hashes_for(c, c4, c8, word_next(c->word, ch), &c->spec_ch[b],
+		    c->spec_g[b]);
 		line_hashes(c, c->spec_g[b], 0, c->spec_hh[b]);
 		lines_prefetch(c, c->spec_hh[b]);
 		c->spec_mi[b] = match_index(c, c4, c8);
@@ -430,7 +450,7 @@ void p1_ctx_update(p1_ctx *c, int bit)
 	} else
 #endif
 	{
-		for (unsigned k = 0; k < P1_NCM; k++) {
+		for (unsigned k = 0; k < c->ncm; k++) {
 			slot_update(&c->arena[c->si[k]], bit, LIMIT_SLOW);
 			hm_update(&c->hmap[c->hmi[k]], bit, LIMIT_HMAP);
 		}

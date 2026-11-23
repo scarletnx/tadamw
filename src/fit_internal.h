@@ -10,16 +10,35 @@
 #include "p1.h"
 
 /* One training bit: the context-model inputs (stretch units), the selector
- * context and the bit. */
+ * context and the bit. Profile 1's feature pass fills P1_NCTX inputs;
+ * profile 2's fills P1_NCTX_ALL (every candidate model), and a net reads
+ * the ones of its lanes through fit_sample_map. */
 typedef struct {
-	int16_t st[P1_NCTX];
+	int16_t st[P1_NCTX_ALL];
 	uint8_t c0, c1, msel, bit;
 } sample;
+
+/* map[i]: where a net of shape s finds its input i in a sample. */
+static inline void fit_sample_map(const p1_shape *s, uint8_t map[P1_NCTX])
+{
+	for (unsigned i = 0; i < P1_NCTX; i++)
+		map[i] = (uint8_t)i;
+	if (!s->chunk)
+		return;
+	for (unsigned t = 0; t < P1_NHASH; t++) {
+		map[2 + t] = (uint8_t)(2 + s->lane[t]);
+		map[P1_NCM + 2 + t] = (uint8_t)(P1_NCM_ALL + 2 + s->lane[t]);
+	}
+	map[P1_NCM] = P1_NCM_ALL;
+	map[P1_NCM + 1] = P1_NCM_ALL + 1;
+	map[P1_IN_MATCH] = 2 * P1_NCM_ALL;
+}
 
 /* The trainable network: layer-1 sets then output-layer sets, rows as the
  * model section stores them. */
 typedef struct {
 	p1_shape s;
+	uint8_t map[P1_NCTX];      /* fit_sample_map(&s) */
 	size_t s1, s2, row1, row2; /* sets, params per set */
 	size_t n1, n2;             /* params per layer */
 	float *w, *m, *v, *g;      /* [n1 + n2] each */
@@ -72,10 +91,11 @@ static inline int fit_warm_epochs(int epochs)
 
 typedef struct taw_gpu taw_gpu;
 
-/* Open a GPU and upload the samples. TAW_E_GPU when there is no usable
- * device (or no GPU support in this build). debug: print notes to stderr. */
-taw_status taw_gpu_open(const sample *sm, size_t ns, bool debug,
-    taw_gpu **out);
+/* Open a GPU and upload the samples as nets of shape s read them. TAW_E_GPU
+ * when there is no usable device (or no GPU support in this build). debug:
+ * print notes to stderr. */
+taw_status taw_gpu_open(const sample *sm, size_t ns, const p1_shape *s,
+    bool debug, taw_gpu **out);
 /* Whether the GPU trainer handles this shape (hidden <= 16). */
 bool taw_gpu_fits(const p1_shape *s);
 /* Train nets[0..k) concurrently, all for `epochs` epochs over the samples.

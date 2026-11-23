@@ -1,9 +1,9 @@
 # tar_aw container format, version 1
 
-Status: draft. Normative for everything implemented (profiles 0 and 1);
+Status: draft. Normative for everything implemented (profiles 0, 1 and 2);
 reserved values are listed so that decoders can refuse them.
-`tests/test_p1.c` pins profile 1 with golden vectors: a change that breaks
-them changes the format.
+`tests/test_p1.c` and `tests/test_p2.c` pin profiles 1 and 2 with golden
+vectors: a change that breaks them changes the format.
 
 All integers are unsigned and little-endian unless stated otherwise.
 `crc32c` is CRC-32C (Castagnoli, reflected polynomial `0x82F63B78`, init
@@ -52,7 +52,8 @@ identical probabilities for every bit.
 |----|-----------------|---------------|--------|
 | 0  | `INT_ORDER0`    | empty (`model_size = 0`, `quant = 0`) | implemented, placeholder |
 | 1  | `F32_STRICT_MIX`| mixer shape and weights, §5.1; quant `F16`, `Q8`, `Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4` or `IQ2` | implemented |
-| 2..255 | — | — | reserved, refuse |
+| 2  | `F32_STRICT_CHUNK`| mixer shape, lanes, routing table and weights, §5.2; the same quants | implemented |
+| 3..255 | — | — | reserved, refuse |
 
 ### 2.1 Profile 0: `INT_ORDER0`
 
@@ -306,6 +307,86 @@ and the same `A2` entry are updated: `e += (65535 - e) >> 6` if `b`, else
    `nib = 1` and select lines with `q = c0`. At `bitpos` 8: byte end
    (§2.2.5).
 
+### 2.3 Profile 2: `F32_STRICT_CHUNK`
+
+Profile 1 with a chunk stage. A routing table from the model section cuts
+the bytes into chunks and the chunks into lines, as they are decoded. Four
+more hashed context models are keyed by them, and the model section names
+which ten of the fourteen hashed models (profile 1's ten and these four)
+run. The decoder does per bit exactly what profile 1 does; the chunk
+stage costs one step per byte.
+
+Everything not stated here is profile 1's: the arithmetic conventions,
+§2.2.1 to §2.2.3, the models o0 and o1, the line selection and tags of
+§2.2.4, the byte end, the match model, the selectors, the mixer, the APM
+stages and the per-bit sequence. The mixer has the same 26 inputs.
+
+#### 2.3.1 Routing table
+
+`cls[0..255]` gives every byte value a class `0..15`, and `row[0..15]` and
+`row2[0..15]` are 16-bit masks (§5.2). For a byte `b` that follows the
+byte `a`:
+
+```
+chunk_boundary(a, b) = bit cls[b] of row[cls[a]]
+line_boundary(a, b)  = chunk_boundary(a, b) and bit cls[b] of row2[cls[a]]
+```
+
+A chunk boundary means that `b` starts a new chunk; a line boundary, that
+this chunk also starts a new line. The decision uses only the byte just
+decoded and the one before it.
+
+#### 2.3.2 Chunk and line state
+
+Reset at the start of every coding unit, with the state of §2.2.2:
+
+| state | initial value |
+|-------|---------------|
+| `ck0`, `ck1`, `ck2`: hashes of the chunk so far, of the chunk before it and of the one before that | `0` |
+| `idx`: chunks closed in the current line, at most 128 | `0` |
+| `cur[0..127]`, `prv[0..127]`: the closed chunks of the current line and of the line before, by their place | all `0` |
+| `ab`: the chunk at place `idx` in the line before | `0` |
+
+At a byte end (§2.2.5), after step 3 and before the byte hashes of step 4
+are computed, with `ch` the byte just coded and `a` the byte before it
+(the first byte of a coding unit takes no boundary):
+
+```
+if this is not the unit's first byte and chunk_boundary(a, ch):
+    if idx < 128: cur[idx] = ck0
+    ck2 = ck1; ck1 = ck0; ck0 = 0
+    if line_boundary(a, ch):
+        swap cur and prv; idx = 0; ab = prv[0]
+    else:
+        idx = min(idx + 1, 128)
+        ab = prv[idx] if idx < 128 else 0
+ck0 = (ck0 xor (ch + 1)) * 0x01000193
+```
+
+The two arrays are swapped, never cleared: a place that the line before
+did not reach still holds what an earlier line left there.
+
+#### 2.3.3 Context models and lanes
+
+The fourteen hashed context models, by id, with their byte hashes:
+
+| id | name | byte hash |
+|----|------|-----------|
+| 0..9 | profile 1's `o2, o3, o4, o6, sparse 2,3, word, sparse 3,4, sparse 2,4, sparse 1,4, sparse 1,2,7,8` | `g_2 .. g_11` of §2.2.4 |
+| 10 | chunk, chunk before | `H(ck0, ck1, 15)` |
+| 11 | chunk, place in the line | `H(ck0, col, 16)` |
+| 12 | chunk, chunk two back | `H(ck0, ck2, 17)` |
+| 13 | chunk, chunk above | `H(ck0, ab + col, 18)` |
+
+with `col = (idx + 1) * 0x9E3779B1`.
+
+The model section gives `lane[0..9]`, ten ids in increasing order. Hashed
+model `k = 2 + j` of §2.2.4 (table `T_k`, history map `HM_k`, inputs
+`st[k]` and `st[12 + k]`) uses the byte hash of context `lane[j]`. With
+`lane = 0, 1, .., 9` the profile computes exactly what profile 1 does.
+When no lane holds an id of 10 or more, there is no routing table and the
+state of §2.3.2 is not kept.
+
 ## 3. Quantization formats
 
 The format in which model weights are stored. Encoders may pick any format
@@ -442,6 +523,35 @@ code bits. Profile 1 accepts the row formats (`quant` 1 and 4..11);
 A decoder needs about `10 * 2^L * 64 + 2^HB + 4 * 2^MB` bytes of tables
 plus about 4.6 MB fixed (o1 table and APM), and resets them per coding
 unit.
+
+### 5.2 Profile 2 model
+
+The 8-byte head of §5.1 with the same valid ranges, then:
+
+| size | field | valid |
+|------|-------|-------|
+| 10 | `lane[0..9]`, context ids (§2.3.3) | each `0..13`, strictly increasing |
+| 192 | routing table, only if `lane[9] >= 10` | below |
+
+and then the weight payload exactly as in §5.1 (the mixer has the same 26
+inputs, in lane order).
+
+The routing table (§2.3.1):
+
+| off | size | field |
+|-----|------|-------|
+| 0 | 128 | `cls`: the class of byte `b` is bits `4 (b mod 2) ..` of byte `b / 2` |
+| 128 | 32 | `row[0..15]`, 16 bits each, little-endian |
+| 160 | 32 | `row2[0..15]`, 16 bits each, little-endian |
+
+`row2[a]` MUST NOT have a bit that `row[a]` lacks. Every other value is
+valid.
+
+`model_size` MUST equal `18`, plus `192` when the routing table is there,
+plus the payload size. A decoder MUST refuse (format error) whatever §5.1
+refuses, a lane id above 13, lanes that are not strictly increasing, and a
+`row2` bit outside `row`. The tables and their size are profile 1's; the
+chunk stage adds about 1 KiB of state.
 
 ## 6. aw body (kind 0)
 

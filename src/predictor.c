@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Arithmetic profiles: 0 = INT_ORDER0 (placeholder), 1 = F32_STRICT_MIX. */
+/* Arithmetic profiles: 0 = INT_ORDER0 (placeholder), 1 = F32_STRICT_MIX,
+ * 2 = F32_STRICT_CHUNK (profile 1 with the chunk stage). */
 #include <stdlib.h>
 #include <string.h>
 
@@ -41,7 +42,8 @@ bool taw_pred_supported(uint8_t profile, uint8_t quant)
 {
 	switch (profile) {
 	case TAW_PROFILE_INT_ORDER0: return quant == TAW_QUANT_NONE;
-	case TAW_PROFILE_F32_STRICT_MIX: return p1_quant_supported(quant);
+	case TAW_PROFILE_F32_STRICT_MIX:
+	case TAW_PROFILE_F32_STRICT_CHUNK: return p1_quant_supported(quant);
 	default: return false;
 	}
 }
@@ -69,7 +71,8 @@ taw_status taw_pred_init(taw_pred *pr, uint8_t profile, uint8_t quant,
 		free(m);
 		return TAW_E_NOMEM;
 	}
-	taw_status st = p1_net_load(&m->net, quant, model, model_size);
+	taw_status st = p1_net_load(&m->net,
+	    profile == TAW_PROFILE_F32_STRICT_CHUNK, quant, model, model_size);
 	if (st == TAW_OK) {
 		st = p1_ctx_init(&m->ctx, &m->net.s);
 		if (st != TAW_OK)
@@ -120,7 +123,7 @@ static inline void o0_update(taw_pred *pr, int bit)
 	pr->c0 = 2 * pr->c0 + (uint32_t)bit;
 }
 
-/* ---- profile 1 -------------------------------------------------------------- */
+/* ---- profiles 1 and 2 ------------------------------------------------------- */
 
 static inline uint32_t p1_p16(struct taw_p1 *m)
 {

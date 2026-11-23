@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Profile 1 model section: parsing, dequantization, inference. */
+/* Profile 1 and 2 model sections: parsing, dequantization, inference. */
 #include <stdlib.h>
 #include <string.h>
 
@@ -46,6 +46,60 @@ taw_status p1_head_parse(const uint8_t *p, size_t n, p1_shape *s)
 		return TAW_E_FORMAT;
 	if (s->hidden == 0 && s->sel1 != P1_SEL_NONE)
 		return TAW_E_FORMAT;
+	return TAW_OK;
+}
+
+/* Profile 2 (format.md §5.2): after the head, the context id of each
+ * hashed lane; then, when a lane holds a chunk context, the routing table:
+ * cls as 256 nibbles (byte b in bits 4 (b mod 2).. of byte b / 2), the 16
+ * rows and the 16 line rows, little-endian. */
+void p2_head_write(uint8_t *out, const p1_shape *s)
+{
+	p1_head_write(out, s);
+	out += P1_MODEL_HEAD;
+	for (unsigned k = 0; k < P1_NHASH; k++)
+		out[k] = s->lane[k];
+	if (!p2_shape_routes(s))
+		return;
+	out += P1_NHASH;
+	const p2_route *r = &s->route;
+	for (unsigned b = 0; b < 256; b += 2)
+		out[b / 2] = (uint8_t)(r->cls[b] | r->cls[b + 1] << 4);
+	for (unsigned k = 0; k < P2_NCLASS; k++) {
+		out[128 + 2 * k] = (uint8_t)r->row[k];
+		out[128 + 2 * k + 1] = (uint8_t)(r->row[k] >> 8);
+		out[160 + 2 * k] = (uint8_t)r->row2[k];
+		out[160 + 2 * k + 1] = (uint8_t)(r->row2[k] >> 8);
+	}
+}
+
+/* The part of a profile 2 section after the 8-byte head and before the
+ * weights; s already holds the head. */
+static taw_status p2_head_parse(const uint8_t *p, size_t n, p1_shape *s)
+{
+	s->chunk = true;
+	if (n < P1_NHASH)
+		return TAW_E_FORMAT;
+	for (unsigned k = 0; k < P1_NHASH; k++) {
+		s->lane[k] = p[k];
+		if (p[k] >= P2_NCAND || (k && p[k] <= p[k - 1]))
+			return TAW_E_FORMAT;
+	}
+	if (!p2_shape_routes(s))
+		return TAW_OK;
+	p += P1_NHASH;
+	if (n - P1_NHASH < P2_ROUTE_BYTES)
+		return TAW_E_FORMAT;
+	p2_route *r = &s->route;
+	for (unsigned b = 0; b < 256; b++)
+		r->cls[b] = (p[b / 2] >> (4 * (b & 1))) & 15;
+	for (unsigned k = 0; k < P2_NCLASS; k++) {
+		r->row[k] = taw_rd16(p + 128 + 2 * k);
+		r->row2[k] = taw_rd16(p + 160 + 2 * k);
+		/* a line starts only where a chunk does */
+		if (r->row2[k] & ~r->row[k])
+			return TAW_E_FORMAT;
+	}
 	return TAW_OK;
 }
 
@@ -172,16 +226,20 @@ static taw_status read_rows(const uint8_t **pp, uint8_t quant, p1_isa isa,
 	return TAW_OK;
 }
 
-taw_status p1_net_load(p1_net *n, uint8_t quant, const uint8_t *model,
-    size_t size)
+taw_status p1_net_load(p1_net *n, bool chunk, uint8_t quant,
+    const uint8_t *model, size_t size)
 {
 	memset(n, 0, sizeof *n);
 	if (!p1_quant_supported(quant))
 		return TAW_E_UNSUPPORTED;
 	taw_status st = p1_head_parse(model, size, &n->s);
+	if (st == TAW_OK && chunk)
+		st = p2_head_parse(model + P1_MODEL_HEAD, size - P1_MODEL_HEAD,
+		    &n->s);
 	if (st != TAW_OK)
 		return st;
-	if (size - P1_MODEL_HEAD != p1_weights_size(&n->s, quant))
+	const size_t head = p1_head_size(&n->s);
+	if (size - head != p1_weights_size(&n->s, quant))
 		return TAW_E_FORMAT;
 
 	const p1_shape *s = &n->s;
@@ -212,7 +270,7 @@ taw_status p1_net_load(p1_net *n, uint8_t quant, const uint8_t *model,
 	default: n->mix = p1_mix_scalar; break;
 	}
 
-	const uint8_t *p = model + P1_MODEL_HEAD;
+	const uint8_t *p = model + head;
 	float tmp[P1_HMAX + P1_F];
 	/* Layer 1 row (set, j) lands transposed: w1[set][i][j]. */
 	for (size_t set = 0; set < s1; set++) {
