@@ -1077,7 +1077,7 @@ static const struct {
 	{1u << 20, 64, 1},
 	{1u << 20, 96, 2},
 	{1u << 20, 128, 2},
-	{1u << 21, 256, 3},
+	{1u << 20, 256, 2},
 };
 
 static taw_status route_fit(const taw_source *in, const taw_params *p,
