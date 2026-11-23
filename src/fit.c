@@ -16,27 +16,14 @@
 #endif
 
 #include "fit_internal.h"
+#include "fit_opt.h"
 #include "format.h"
 #include "half.h"
 #include "p1.h"
 #include "quant.h"
 #include "taw_internal.h"
 
-/* ---- small math without libm ---------------------------------------------- */
-
-static float fsqrt(float x)
-{
-#if defined(__x86_64__) || defined(__i386__)
-	return _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(x)));
-#else
-	if (x <= 0.0f)
-		return 0.0f;
-	float r = taw_bits_f32((taw_f32_bits(x) >> 1) + 0x1FC00000u);
-	for (int i = 0; i < 4; i++)
-		r = 0.5f * (r + x / r);
-	return r;
-#endif
-}
+/* fsqrt and the Newton-Schulz polynomial live in fit_opt.h (one copy). */
 
 /* log2(x) for x > 0, good to ~1e-9; used only for size estimates. */
 static double dlog2(double x)
@@ -431,36 +418,11 @@ static void tnet_untie(tnet *t)
  * two W1 updates, alternate them per step, or route each W1 set to one of
  * them. AdamW state for W1 is kept in t->m1/t->v1 so it never aliases Muon's
  * momentum in t->m.
+ *
+ * The configuration types (hyb_mode, optcfg), the dispatch ABI (opt_plan,
+ * opt_hooks) and the thin wrappers all live in fit_opt.h / fit_opt.c. This
+ * file keeps only env parsing, the LR schedule and the per-set dispatch.
  */
-enum { MUON_MAXDIM = 32, MUON_MAXEL = MUON_MAXDIM * MUON_MAXDIM };
-
-typedef enum {
-	HYB_ADAM = 0, /* the shipped optimizer: AdamW everywhere */
-	HYB_MUON,     /* Muon on W1 matrices, AdamW on W2 vectors */
-	HYB_BLEND,    /* W1: alpha*Muon + (1-alpha)*AdamW */
-	HYB_ALT,      /* W1: alternate Muon / AdamW by step or by half */
-	HYB_ROUTE,    /* W1: Muon for hot sets, AdamW for cold sets */
-	HYB_MALT,     /* W1: MALT (two-sided diagonal preconditioned Muon) */
-	HYB_MALTER    /* W1: MALTER (MALT + adaptive step-size rescaling) */
-} hyb_mode;
-
-/* Norm-grafting source for the MALT update magnitude. */
-enum { GRAFT_O = 0, /* paper: ||Orth(M~)||_F */
-       GRAFT_D = 1, /* no renormalisation: ||D||_F */
-       GRAFT_M = 2 /*||M~||_F */ };
-
-typedef struct {
-	float lr, lrvec, lr1;  /* current LRs: Muon W1, Adam W2, Adam W1 */
-	float wd, vecwd, wd1;  /* decoupled weight decay */
-	float b1, b2, eps;     /* Adam */
-	float mom, gain;       /* Muon */
-	float b1t, b2t;        /* b1^t, b2^t */
-	float malt_b2, malt_eps;   /* diagonal-preconditioner EMA / damping */
-	float malt_b1t, malt_b2t;  /* momentum^t, malt_b2^t (MALTER bias correction) */
-	unsigned ns_steps;
-	int graft;             /* MALT graft mode */
-	bool nesterov;
-} optcfg;
 
 /* Tuning hooks (encoder-only; unset = shipped behaviour). */
 static float fit_env_float(const char *name, float def)
@@ -483,231 +445,9 @@ static unsigned fit_env_uint(const char *name, unsigned def)
 	return end != s ? (unsigned)v : def;
 }
 
-/* AdamW on a flat vector. `mix` scales the whole update (1 for plain AdamW,
- * 1-alpha for the Adam half of a blend). Gradients are cleared by caller. */
-/* `risk` (FARO only) accumulates the squared applied update of block `bid`;
- * NULL keeps the shipped update bit-for-bit. The w update itself is never
- * rewritten: the extra multiply is done separately, so rounding is unchanged. */
-static void adam_rows(optcfg *o, float *w, float *m, float *v, const float *g,
-    size_t len, float scale, float lr, float wd, float mix, float *risk,
-    unsigned bid)
-{
-	const float c1 = 1.0f / (1.0f - o->b1t), c2 = 1.0f / (1.0f - o->b2t);
-	for (size_t k = 0; k < len; k++) {
-		float gk = g[k] * scale;
-		m[k] = o->b1 * m[k] + (1.0f - o->b1) * gk;
-		v[k] = o->b2 * v[k] + (1.0f - o->b2) * gk * gk;
-		float mh = m[k] * c1, vh = v[k] * c2;
-		w[k] -= mix * lr * (mh / (fsqrt(vh) + o->eps) + wd * w[k]);
-		if (risk) {
-			float upd = mix * lr * (mh / (fsqrt(vh) + o->eps));
-			risk[bid] += upd * upd; /* decoupled wd is not part of Δ_b */
-		}
-	}
-}
-
-/* Muon on a row-major rows x cols matrix. Largest shape here is
- * P1_HMAX x P1_F = 32 x 26, so scratch fits on the stack. */
-static void muon_rows(const optcfg *o, float *w, float *m, const float *g,
-    size_t rows, size_t cols, float scale, float lr, float wd, float mix,
-    float *risk, unsigned bid)
-{
-	float x[MUON_MAXEL], a[MUON_MAXEL], b[MUON_MAXEL], y[MUON_MAXEL];
-	const bool tr = rows > cols; /* work with the shorter dimension first */
-	const size_t mr = tr ? cols : rows, mc = tr ? rows : cols;
-	if (rows * cols > MUON_MAXEL || mr == 0 || mc == 0)
-		return;
-	for (size_t i = 0; i < rows * cols; i++) {
-		float gi = g[i] * scale;
-		m[i] = o->mom * m[i] + gi;
-		float u = o->nesterov ? o->mom * m[i] + gi : m[i];
-		size_t at = tr ? (i % cols) * mc + i / cols : i;
-		x[at] = u;
-	}
-	float ss = 0.0f;
-	for (size_t i = 0; i < mr * mc; i++)
-		ss += x[i] * x[i];
-	float norm = fsqrt(ss);
-	if (!(norm > 1e-12f))
-		return; /* zero gradient: leave weights alone */
-	for (size_t i = 0; i < mr * mc; i++)
-		x[i] *= 1.0f / norm;
-	for (unsigned it = 0; it < o->ns_steps; it++) {
-		for (size_t i = 0; i < mr; i++)
-			for (size_t j = 0; j < mr; j++) {
-				float s = 0.0f;
-				for (size_t k = 0; k < mc; k++)
-					s += x[i * mc + k] * x[j * mc + k];
-				a[i * mr + j] = s;
-			}
-		for (size_t i = 0; i < mr; i++)
-			for (size_t j = 0; j < mr; j++) {
-				float s = 0.0f;
-				for (size_t k = 0; k < mr; k++)
-					s += a[i * mr + k] * a[k * mr + j];
-				b[i * mr + j] = -4.7750f * a[i * mr + j] + 2.0315f * s;
-			}
-		for (size_t i = 0; i < mr; i++)
-			for (size_t k = 0; k < mc; k++) {
-				float s = 0.0f;
-				for (size_t j = 0; j < mr; j++)
-					s += b[i * mr + j] * x[j * mc + k];
-				y[i * mc + k] = s;
-			}
-		for (size_t i = 0; i < mr * mc; i++)
-			x[i] = 3.4445f * x[i] + y[i];
-	}
-	const size_t dmax = rows > cols ? rows : cols;
-	const float factor = mix * lr * o->gain * fsqrt((float)dmax);
-	for (size_t i = 0; i < rows * cols; i++) {
-		size_t at = tr ? (i % cols) * mc + i / cols : i;
-		w[i] -= factor * x[at] + mix * lr * wd * w[i];
-		if (risk) {
-			float upd = factor * x[at];
-			risk[bid] += upd * upd; /* only the geometry-induced Δ_b */
-		}
-	}
-}
-
-/* x^{-1/8} without libm; x > 0 thanks to the damping term. */
-static inline float inv_root8(float x)
-{
-	return 1.0f / fsqrt(fsqrt(fsqrt(x)));
-}
-
-/* MALT / MALTER (arXiv:2608.05088, Algorithms 1-2) on a row-major
- * rows x cols matrix. l/r are this set's row/column EMA vectors, nu the
- * scalar MALTER second moment. With `adaptive` false this is plain MALT:
- *   M = mom*M + G          (Nesterov extrapolation when enabled)
- *   l = b2*l + (1-b2)*sum_j G_ij^2 ;  r = b2*r + (1-b2)*sum_i G_ij^2
- *   L = diag((l+eps)^-1/8), R = diag((r+eps)^-1/8)
- *   M~ = L M R ;  O = Orth(M~) ;  D = L O R
- *   W -= lr * (||O||_F / (||D||_F + eps)) * D
- * MALTER adds nu = b2*nu + (1-b2)*||L G R||^2 and rescales by
- *   alpha = sqrt(1-b2^t)/(1-mu1^t+eps) * ||M~||_F / (sqrt(nu)+eps).
- * Orthogonalization reuses Muon's Newton-Schulz polynomial. */
-static void malt_rows(const optcfg *o, float *w, float *m, float *l, float *r,
-    float *nu, const float *g, size_t rows, size_t cols, float scale,
-    float lr, float wd, float mix, bool adaptive, float *risk, unsigned bid)
-{
-	float x[MUON_MAXEL], a[MUON_MAXEL], b[MUON_MAXEL], y[MUON_MAXEL];
-	float Lc[MUON_MAXDIM], Rc[MUON_MAXDIM];
-	const bool tr = rows > cols; /* work with the shorter dimension first */
-	const size_t mr = tr ? cols : rows, mc = tr ? rows : cols;
-	if (rows * cols > MUON_MAXEL || mr == 0 || mc == 0)
-		return;
-	const float b2 = o->malt_b2, one_b2 = 1.0f - b2, eps = o->malt_eps;
-
-	/* Momentum and EMA of squared row / column gradient norms. */
-	for (size_t i = 0; i < rows; i++)
-		l[i] *= b2;
-	for (size_t j = 0; j < cols; j++)
-		r[j] *= b2;
-	for (size_t i = 0; i < rows; i++) {
-		for (size_t j = 0; j < cols; j++) {
-			const size_t idx = i * cols + j;
-			const float gi = g[idx] * scale;
-			const float mm = o->mom * m[idx] + gi;
-			m[idx] = mm;
-			const float u = o->nesterov ? o->mom * mm + gi : mm;
-			l[i] += one_b2 * gi * gi;
-			r[j] += one_b2 * gi * gi;
-			const size_t at = tr ? j * mc + i : idx;
-			x[at] = u;
-		}
-	}
-	for (size_t i = 0; i < rows; i++)
-		Lc[i] = inv_root8(l[i] + eps);
-	for (size_t j = 0; j < cols; j++)
-		Rc[j] = inv_root8(r[j] + eps);
-
-	/* Preconditioned momentum M~ = L M R; also accumulate ||L G R||^2. */
-	float pg2 = 0.0f, ss = 0.0f;
-	for (size_t i = 0; i < rows; i++) {
-		for (size_t j = 0; j < cols; j++) {
-			const size_t idx = i * cols + j;
-			const size_t at = tr ? j * mc + i : idx;
-			x[at] *= Lc[i] * Rc[j];
-			ss += x[at] * x[at];
-			if (adaptive) {
-				const float gv = Lc[i] * Rc[j] * g[idx] * scale;
-				pg2 += gv * gv;
-			}
-		}
-	}
-	float norm = fsqrt(ss); /* ||M~||_F, also the MALTER signal magnitude */
-	if (!(norm > 1e-12f))
-		return;
-	const float recip = 1.0f / norm;
-	for (size_t i = 0; i < mr * mc; i++)
-		x[i] *= recip;
-	for (unsigned it = 0; it < o->ns_steps; it++) {
-		for (size_t i = 0; i < mr; i++)
-			for (size_t j = 0; j < mr; j++) {
-				float s = 0.0f;
-				for (size_t k = 0; k < mc; k++)
-					s += x[i * mc + k] * x[j * mc + k];
-				a[i * mr + j] = s;
-			}
-		for (size_t i = 0; i < mr; i++)
-			for (size_t j = 0; j < mr; j++) {
-				float s = 0.0f;
-				for (size_t k = 0; k < mr; k++)
-					s += a[i * mr + k] * a[k * mr + j];
-				b[i * mr + j] = -4.7750f * a[i * mr + j] + 2.0315f * s;
-			}
-		for (size_t i = 0; i < mr; i++)
-			for (size_t k = 0; k < mc; k++) {
-				float s = 0.0f;
-				for (size_t j = 0; j < mr; j++)
-					s += b[i * mr + j] * x[j * mc + k];
-				y[i * mc + k] = s;
-			}
-		for (size_t i = 0; i < mr * mc; i++)
-			x[i] = 3.4445f * x[i] + y[i];
-	}
-
-	/* O = x; D = L O R (map the orthogonal direction back). */
-	float o2 = 0.0f, d2 = 0.0f;
-	for (size_t i = 0; i < mr * mc; i++)
-		o2 += x[i] * x[i];
-	for (size_t i = 0; i < rows; i++) {
-		for (size_t j = 0; j < cols; j++) {
-			const size_t at = tr ? j * mc + i : i * cols + j;
-			x[at] *= Lc[i] * Rc[j];
-			d2 += x[at] * x[at];
-		}
-	}
-	const float normD = fsqrt(d2);
-	if (!(normD > 1e-12f))
-		return;
-	/* Graft the magnitude from O (paper), M~ (ablation) or leave D as-is. */
-	float graft = o->graft == GRAFT_M ? norm
-		    : o->graft == GRAFT_D ? normD : fsqrt(o2);
-	graft /= normD + eps;
-	float fac = mix * lr * graft;
-	if (adaptive) {
-		*nu = b2 * *nu + one_b2 * pg2;
-		/* The codebase's momentum is M = mu*M + G, while the paper's is
-		 * M = mu*M + (1-mu)*G. Rescale ||M~|| by (1-mu) so alpha is the
-		 * paper's signal-to-noise ratio (scale-invariant to G). */
-		const float sig = norm * (1.0f - o->mom);
-		const float alpha = fsqrt(1.0f - o->malt_b2t) /
-		    (1.0f - o->malt_b1t + eps) * sig / (fsqrt(*nu) + eps);
-		fac *= alpha;
-	}
-	for (size_t i = 0; i < rows; i++) {
-		for (size_t j = 0; j < cols; j++) {
-			const size_t idx = i * cols + j;
-			const size_t at = tr ? j * mc + i : idx;
-			w[idx] -= fac * x[at] + mix * lr * wd * w[idx];
-			if (risk) { /* FARO: update-to-weight risk, wd excluded */
-				float upd = fac * x[at];
-				risk[bid] += upd * upd;
-			}
-		}
-	}
-}
+/* The optimizer wrappers (adam_rows, muon_rows, malt_rows, ns_score) and
+ * the single Newton-Schulz polynomial now live in fit_opt.c / fit_opt.h.
+ * Their FP expressions were moved verbatim; see tests/test_fit_opt.c. */
 
 static const char *fit_env_str(const char *name, const char *def)
 {
@@ -1143,6 +883,9 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
     uint64_t seed)
 {
 	enum { BATCH = FIT_BATCH };
+	/* One hook ABI. FARO publishes its per-block risk bank through hooks.risk;
+	 * with TAW_FARO off the bank stays NULL and every shipped path is bit-exact. */
+	opt_hooks hooks = {0};
 	const char *hs = fit_env_str("TAW_HYBRID", "adam");
 	hyb_mode mode = HYB_ADAM;
 	if (!strcmp(hs, "muon"))
@@ -1309,6 +1052,8 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 			if (fr.on && fr.frozen && fr.alloc)
 				faro_allocate(&fr, &o);
 			fr.risk = fr.on && fr.frozen && fr.alloc ? fr.usum : nullptr;
+			hooks.risk = fr.risk;
+			hooks.nb = fr.on ? (unsigned)fr.nb : 0u;
 			for (size_t k = 0; k < n1; k++) {
 				size_t set = t->list1[k], off = set * t->row1;
 				bool muon = mode == HYB_MUON ||
@@ -1347,31 +1092,31 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 					adam_rows(&o, t->w + off, t->m + off,
 					    t->v + off, t->g + off, t->row1,
 					    scale, lrvec_w1, o.vecwd, 1.0f,
-					    fr.risk, bid);
+					    &hooks, bid);
 				} else if (malty && !(t->tied && warm_adam)) {
 					malt_rows(&o, t->w + off, t->m + off,
 					    t->malt_l + set * H,
 					    t->malt_r + set * P1_F,
 					    t->malt_nu + set, t->g + off,
 					    H, P1_F, scale, lr_w1, o.wd, 1.0f,
-					    mode == HYB_MALTER, fr.risk, bid);
+					    mode == HYB_MALTER, &hooks, bid);
 				} else if (mode == HYB_BLEND) {
 					adam_rows(&o, t->w + off, t->m1 + off,
 					    t->v1 + off, t->g + off, t->row1,
 					    scale, lr_a1, o.wd1, 1.0f - alpha,
-					    fr.risk, bid);
+					    &hooks, bid);
 					muon_rows(&o, t->w + off, t->m + off,
 					    t->g + off, H, P1_F, scale, lr_w1,
-					    o.wd, alpha, fr.risk, bid);
+					    o.wd, alpha, &hooks, bid);
 				} else if (muon) {
 					muon_rows(&o, t->w + off, t->m + off,
 					    t->g + off, H, P1_F, scale, lr_w1,
-					    o.wd, 1.0f, fr.risk, bid);
+					    o.wd, 1.0f, &hooks, bid);
 				} else {
 					adam_rows(&o, t->w + off, t->m1 + off,
 					    t->v1 + off, t->g + off, t->row1,
 					    scale, lr_a1, o.wd1, 1.0f,
-					    fr.risk, bid);
+					    &hooks, bid);
 				}
 				t->touched1[set] = 0;
 			}
@@ -1384,7 +1129,7 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 					lrvec_b *= fr.mu[fb];
 				adam_rows(&o, t->w + off, t->m + off, t->v + off,
 				    t->g + off, t->row2, scale, lrvec_b,
-				    o.vecwd, 1.0f, fr.risk,
+				    o.vecwd, 1.0f, &hooks,
 				    fr.on ? (unsigned)fb : 0);
 				t->touched2[set] = 0;
 			}
