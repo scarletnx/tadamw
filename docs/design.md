@@ -338,26 +338,27 @@ archive — including MALTER/Muon runs — is identical to the shipped one.
 `late` is opt-in via the environment only, and GPU warm-start nets are not
 averaged.
 
-### Predictor choices pending format allocation
+### Predictor choices allocated under R-4
 
-`taw c -p gate` (entropy-adaptive confidence gate, proposed profile 11) and
-`taw c -p hnet` (integer H-Net boundary input, proposed profile 14) are
-opt-in predictor studies. The format registry in `docs/format.md` §2
-allocates only profiles 0 and 1; ids 2..255 are reserved and must be
-refused. Their ids are therefore **pending allocation**: `tools/taw.c`
-`--help` and the CLI token tables are deliberately unchanged, so neither
-flag is accepted yet. When an id is allocated, the format spec, loader
-validation, golden vectors, CLI round-trip test, `--help` line and README
-usage line must land together. Until then the default `auto`/`mix` path is
-byte-identical.
+`taw c -p gate` (entropy-adaptive confidence gate, profile 11) and
+`taw c -p hnet` (integer H-Net boundary input, profile 14) are opt-in
+predictor studies. Integration ruling R-4 allocates predictor value 11 to
+`TAW_PREDICTOR_GATE` and value 14 to `TAW_PREDICTOR_HNET`, with matching
+arithmetic-profile ids; `-p gate` and `-p hnet` are their `--help` and CLI
+token names, shipped with PRs #11 and #13. The canonical format registry in
+`docs/format.md` §2 still lists only profiles 0 and 1 — ids 2..255 remain
+reserved and must be refused until the corresponding PR lands — but no
+further id allocation is needed for these two choices. Loader validation,
+golden vectors, the CLI round-trip test, `--help` and the README usage line
+land with each PR. The default `auto`/`mix` path stays byte-identical.
 
-### Calibrated mixer (profile 6, pending allocation)
+### Calibrated mixer (profile 6)
 
 `TAW_CALIBRATED=0|1|on|cal` (default `0`, i.e. off; `1`, `on` and `cal` enable)
 opts the fitter into profile 6 (`CALIBRATED_MIX`), which stores eight bytes of
-fitted temperature/bias/weight parameters in the archive. As with profiles 11
-and 14, profile 6 is **pending format and CLI allocation**: there is no
-predictor enum or `-p` token yet, and `auto`/`mix` always fit profile 1 only.
+fitted temperature/bias/weight parameters in the archive. Integration ruling
+R-4 allocates predictor value 6 to `TAW_PREDICTOR_CALIBRATED` with the `-p cal`
+CLI token (PR #10); `auto`/`mix` still fit profile 1 only.
 The test suite also reads `TAW_CAL_PARAMS=temp,bias,w0,w1,w2` and
 `TAW_CAL_NO_APM=1` as ablation overrides (encoder-only, unset by default);
 they are not product knobs. Profile 6 candidates fit on the CPU even with
@@ -529,6 +530,13 @@ Each decoding thread holds its own tables (about 175 MB for 1 MiB
 blocks), whole blocks are decoded straight into the caller's buffer and
 the partial ones at the edges through a per-thread buffer. The source's
 `read_at` must then be thread safe (`pread` is).
+
+`.awseek` dynamic blocks are opt-in via `-D` (`-T` sets the target block
+bytes and `-C` the change spike threshold, 0 = ratio mode); the default
+archive is byte-identical to fixed blocks and `taw i` reports `dynamic:`.
+The matching public API fields are `taw_params.dyn_blocks`,
+`taw_params.chunk_target`, `taw_params.change_threshold` and
+`taw_info.has_dyn_blocks`.
 
 ## Source layout
 

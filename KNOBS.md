@@ -39,8 +39,17 @@ documentation is a RESULTS report is **undocumented** for registry purposes.
 | `-w auto\|f16\|…\|iq2` | encoder flag | main | `auto` | help ✓ README ✓ | none | encoder-only |
 | `-j N` | encoder/decoder flag | main | `1` | help ✓ README ✓ | none | threads; decoder output pinning tested |
 | `-g off\|auto\|on` | encoder flag | main | `off` | help ✓ README ✓ | none | opt-in GPU |
-| `-p gate` | encoder flag + enum `TAW_PREDICTOR_GATE` | **#11** | `auto` (opt-in) | help ✓ (branch), design/format ✓, **README ✗** (audit required it) | profile id 11 reserved by other unmerged branches (audit/b) | none while `auto`/`mix` unchanged ✓ |
-| `-p hnet` | encoder flag + enum `TAW_PREDICTOR_HNET` | **#13** | `auto` (opt-in) | help ✓ README ✓ design/format ✓ | profile id 14 also claimed by sibling branches | none while `auto`/`mix` unchanged ✓ |
+| `-B` (help line restored) | help text | #15 | `1 MiB` | help ✓ (PR branch) | none | existing `-B` flag; no archive change |
+| `-D` | encoder flag | #15 | off | help ✓ (PR branch) | none | default fixed blocks, byte-identical |
+| `-T N` | encoder flag | #15 | `-B` value | help ✓ (PR branch) | none | dynamic-block target |
+| `-C N` | encoder flag | #15 | `0` (ratio) | help ✓ (PR branch) | none | change spike threshold 0..256 |
+| `taw_params.dyn_blocks` | public API field | #15 | `false` | `taw.h` comment (PR branch) | none | opt-in dynamic chunks; byte-identical default |
+| `taw_params.chunk_target` | public API field | #15 | `0` (= block size) | `taw.h` comment (PR branch) | none | target block bytes |
+| `taw_params.change_threshold` | public API field | #15 | `0` (ratio) | `taw.h` comment (PR branch) | none | byte surprise 0..256 |
+| `taw_info.has_dyn_blocks` | public API field | #15 | `false` | `taw.h` comment (PR branch) | none | reports variable-length blocks |
+| `-p gate` | encoder flag + enum `TAW_PREDICTOR_GATE` | **#11** | `auto` (opt-in) | help ✓ (branch), design/format ✓, **README ✗** (audit required it) | R-4: allocated value 11 / profile 11 | none while `auto`/`mix` unchanged ✓ |
+| `-p hnet` | encoder flag + enum `TAW_PREDICTOR_HNET` | **#13** | `auto` (opt-in) | help ✓ README ✓ design/format ✓ | R-4: allocated value 14 / profile 14 | none while `auto`/`mix` unchanged ✓ |
+| `-p cal` | encoder flag + enum `TAW_PREDICTOR_CALIBRATED` | **#10** | `auto` (opt-in) | help ✓ (branch), design/format ✓ | R-4: allocated value 6 / profile 6 | none while `auto`/`mix` unchanged ✓ |
 
 There is **no CLI flag** for any optimizer/averaging/epsilon knob in any PR.
 #21 adds no CLI flag.
