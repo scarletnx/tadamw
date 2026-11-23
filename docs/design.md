@@ -243,6 +243,101 @@ stderr, whether the GPU was used (or why not) and the fitting time;
 `TAW_FIT_DEBUG=a` fits all candidates (slow; that is how the prior was
 calibrated).
 
+## Environment knobs (encoder-only)
+
+Every knob that can change fitted weights defaults to the shipped setting.
+With none of the variables below set — and with the `auto`/`mix` predictors —
+the encoder reproduces the shipped archives byte for byte at every level on
+all golden corpora. `auto`/`mix` and the shipped optimizer are never changed
+by an environment variable. All `TAW_*` overrides are read by the encoder
+only: they are tuning hooks, not CLI options or API fields, they do not
+change the archive format, and they never affect decoding or random access.
+Unset means shipped behaviour; diagnostics print to stderr only.
+
+The knobs below are the supported survivors of the in-flight fitting studies,
+grouped by feature. Each group states its byte-identity guarantee.
+
+### FARO-ERC allocation
+
+| variable | default | effect |
+|----------|---------|--------|
+| `TAW_FARO=off\|on` | `off` | enables the ERC risk allocation lane |
+| `TAW_FARO_ALLOC=erc\|none` | `erc` | `none` disables reallocation (multiplier 1) |
+| `TAW_FARO_BLOCKS=set\|layer` | `set` | risk-block granularity |
+| `TAW_FARO_CAP`, `TAW_FARO_GAMMA`, `TAW_FARO_KAPPA`, `TAW_FARO_FLOOR`, `TAW_FARO_CEIL` | `1.4`, `0.9`, `3.0`, `0.5`, `2.0` | allocation cap, risk-EWMA decay, winsor bound, final clamp low/high |
+| `TAW_FARO_DEBUG` | unset | print freeze decisions and multiplier range to stderr |
+
+Only the ERC allocation lane is supported; the counterfactual routing
+experiment is not part of this surface. **Byte identity:** every FARO knob is
+inert until `TAW_FARO=on`; with it unset the shipped update expressions run
+verbatim.
+
+### NAMO / NAMO-D
+
+| variable | default | effect |
+|----------|---------|--------|
+| `TAW_HYBRID=namo\|namod` | `adam` | W1 optimizer: `namo` scalar adaptive scale, `namod` clamped right-diagonal scale |
+| `TAW_NAMO_BETA` | `0.99` | second-moment decay for the adaptive scale |
+| `TAW_NAMO_SCALE` | `1.0` | multiplier of the adaptive W1 step |
+| `TAW_NAMO_CLAMP` | `0.1` | NAMO-D clamp; `0` disables it |
+| `TAW_NAMO_WD` | `1e-3` | adaptive-scaled W1 weight decay |
+| `TAW_NAMO_D_AXIS=col\|row` | `col` | right-diagonal (default) or row-wise ablation |
+| `TAW_NAMO_NEST` | `0` | Nesterov momentum for the NAMO W1 update |
+
+`TAW_MALT`/`TAW_MALTER` take precedence over `TAW_HYBRID`; leave them unset
+when selecting a NAMO mode. Sign gating has one owner, `TAW_EPS_MODE=c3`
+below — there is no NAMO-specific gate setting. The shared `TAW_MUON_NEST`
+keeps its shipped default of `1`; NAMO has its own `TAW_NAMO_NEST`.
+**Byte identity:** all of the above are inert at the default
+`TAW_HYBRID=adam`.
+
+### Flat learning rate
+
+`TAW_LR1=flat` holds the learning rate at `TAW_LR0` instead of decaying to
+`TAW_LR0/20`; a numeric `TAW_LR1` keeps the shipped schedule. **Byte
+identity:** with `TAW_LR1` unset (or numeric) the archive is unchanged.
+
+### Epsilon / sign gate
+
+| variable | default | effect |
+|----------|---------|--------|
+| `TAW_EPS_MODE=none\|c3` | `none` | sign-EMA shrink gate on AdamW vector updates |
+| `TAW_EPS_SIGN_BETA` | `0.9` | sign-EMA decay |
+| `TAW_EPS_GATE_P` | `1.0` | gate exponent |
+| `TAW_EPS_GATE_MODE=mean\|shrink` | `mean` | mean-preserving or shrink-only gate |
+| `TAW_EPS_LAYERS=1\|2\|12` | `2` | layer bitmask (1 = AdamW path, 2 = layer 2) |
+| `TAW_EPS_SCOPE=all\|cold\|warm` | `all` | touch-count stratification |
+| `TAW_EPS_GRAN=row\|set` | `row` | per-weight or per-set granularity |
+| `TAW_EPS_DEBUG` | unset | print per-layer gating statistics to stderr |
+
+This is the single owner of the sign gate; it wraps only AdamW `(m, v)`
+vector updates and leaves the Muon and MALT/MALTER W1 paths untouched.
+**Byte identity:** with `TAW_EPS_MODE` unset (or `none`) every update is the
+shipped one.
+
+### Model averaging
+
+`TAW_FIT_AVG=off|late|swa|ema9|ema95|ema99|ema999|swa_all` (default `off`)
+folds averaged weights into the fitted model. `late` is EMA(0.999) only for
+runs of at least six epochs (levels 3+); levels 1-2 keep the last iterate.
+**Byte identity:** the default is `off`, so with the variable unset every
+archive — including MALTER/Muon runs — is identical to the shipped one.
+`late` is opt-in via the environment only, and GPU warm-start nets are not
+averaged.
+
+### Predictor choices pending format allocation
+
+`taw c -p gate` (entropy-adaptive confidence gate, proposed profile 11) and
+`taw c -p hnet` (integer H-Net boundary input, proposed profile 14) are
+opt-in predictor studies. The format registry in `docs/format.md` §2
+allocates only profiles 0 and 1; ids 2..255 are reserved and must be
+refused. Their ids are therefore **pending allocation**: `tools/taw.c`
+`--help` and the CLI token tables are deliberately unchanged, so neither
+flag is accepted yet. When an id is allocated, the format spec, loader
+validation, golden vectors, CLI round-trip test, `--help` line and README
+usage line must land together. Until then the default `auto`/`mix` path is
+byte-identical.
+
 ## GPU fitting
 
 `src/fit_gpu.c` drives two compute shaders through Vulkan 1.1, which it
