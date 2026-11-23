@@ -17,6 +17,9 @@ taw_test(p1)
 taw_test(quant)
 taw_test(fit_opt) # shared Newton-Schulz polynomial, bit-exactness oracle
 taw_test(gpu)
+# Fitted-model goldens: pin the fitter's own output, not just the hand-built
+# model arithmetic in test_p1.c. Reusable fit_check() lives in fitgolden.h.
+taw_test(fitgolden)
 set_tests_properties(gpu PROPERTIES SKIP_RETURN_CODE 77)
 
 add_test(NAME cli_version COMMAND taw_cli --version)
