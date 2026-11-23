@@ -18,7 +18,7 @@ typedef struct {
 
 /* The trainable network: layer-1 sets then output-layer sets, rows as the
  * model section stores them. */
-typedef struct {
+typedef struct tnet {
 	p1_shape s;
 	size_t s1, s2, row1, row2; /* sets, params per set */
 	size_t n1, n2;             /* params per layer */

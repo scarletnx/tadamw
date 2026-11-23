@@ -442,10 +442,134 @@ static void profiles_test(void)
 	}
 }
 
+/* ---- hooks ABI: one gate owner, risk bank, NULL = shipped path ------------- */
+
+typedef struct {
+	float *sig, *mul;
+	float beta, p;
+	bool mean_pres;
+} test_gate;
+
+static void tg_begin(void *ctx, const float *g, size_t len, float scale)
+{
+	test_gate *t = ctx;
+	float sum = 0.0f;
+	for (size_t k = 0; k < len; k++) {
+		t->mul[k] = fit_gate_step(t->sig + k, g[k] * scale,
+		    t->beta, t->p);
+		sum += t->mul[k];
+	}
+	if (t->mean_pres) {
+		float mean = sum / (float)len;
+		if (!(mean > 1e-12f))
+			mean = 1.0f;
+		for (size_t k = 0; k < len; k++)
+			t->mul[k] /= mean;
+	}
+}
+
+static float tg_gate(void *ctx, size_t k, float gk)
+{
+	(void)gk; /* the bank is already normalized by tg_begin */
+	test_gate *t = ctx;
+	return t->mul[k];
+}
+
+/* Oracle: staged #8's adam_rows_gated math, written out locally so the test
+ * does not depend on a second copy living in fit.c. */
+static void ref_gated_adam(optcfg *o, float *w, float *m, float *v,
+    const float *g, size_t len, float scale, float lr, float wd, float mix,
+    float *sig, float beta, float p, bool mean_pres)
+{
+	const float c1 = 1.0f / (1.0f - o->b1t), c2 = 1.0f / (1.0f - o->b2t);
+	float gate[NS_MAXEL], gsum = 0.0f;
+	for (size_t k = 0; k < len; k++) {
+		float gk = g[k] * scale;
+		m[k] = o->b1 * m[k] + (1.0f - o->b1) * gk;
+		v[k] = o->b2 * v[k] + (1.0f - o->b2) * gk * gk;
+		gate[k] = fit_gate_step(sig + k, gk, beta, p);
+		gsum += gate[k];
+	}
+	float gmean = mean_pres ? gsum / (float)len : 1.0f;
+	if (gmean < 1e-12f)
+		gmean = 1.0f;
+	for (size_t k = 0; k < len; k++) {
+		float upd = (m[k] * c1) / (fsqrt(v[k] * c2) + o->eps) +
+		    wd * w[k];
+		upd *= mean_pres ? gate[k] / gmean : gate[k];
+		w[k] -= mix * lr * upd;
+	}
+}
+
+static bool gate_near(float a, float b)
+{
+	float d = a - b;
+	return d < 0.0f ? -d < 1e-6f : d < 1e-6f;
+}
+
+static void hooks_abi(void)
+{
+	/* The gate's direct numbers are #8's unit test (af5fd00). */
+	float s = 0.0f;
+	CHECK(gate_near(fit_gate_step(&s, 1.0f, 0.9f, 1.0f), 0.1f));
+	CHECK(gate_near(fit_gate_step(&s, 1.0f, 0.9f, 1.0f), 0.19f));
+	float sn = 0.0f;
+	CHECK(gate_near(fit_gate_step(&sn, -1.0f, 0.9f, 1.0f), 0.1f));
+	CHECK(fit_gate_step(&sn, 1.0f, 0.9f, 1.0f) < 0.1f);
+	float s2 = 0.0f;
+	CHECK(gate_near(fit_gate_step(&s2, 1.0f, 0.9f, 2.0f), 0.01f));
+
+	enum { N = 64 };
+	for (int mean_pres = 0; mean_pres < 2; mean_pres++) {
+		optcfg o = cfg(5, true, GRAFT_O);
+		float w[N], wr[N], m[N], mr_[N], v[N], vr[N], g[N];
+		float sig[N] = {0}, sigr[N] = {0}, mul[N];
+		test_gate tg = {.sig = sig, .mul = mul, .beta = 0.9f,
+		    .p = mean_pres ? 1.0f : 2.0f,
+		    .mean_pres = mean_pres != 0};
+		opt_hooks h = {0};
+		h.ctx = &tg;
+		h.shape.ctx = &tg; /* step_shape owns the gate state */
+		h.shape.begin = tg_begin;
+		h.shape.gate = tg_gate;
+		h.nb = 1;
+		float risk[1] = {0};
+		h.risk = risk;
+
+		seq = 0xABBAu + (uint32_t)mean_pres;
+		fill(g, N); fill(w, N);
+		for (size_t k = 0; k < N; k++) {
+			m[k] = mr_[k] = g[k] * 0.1f;
+			v[k] = vr[k] = 1e-3f + (float)(k % 7) * 1e-4f;
+		}
+		memcpy(wr, w, sizeof w);
+
+		adam_rows(&o, w, m, v, g, N, 1.0f / 16, 0.02f, 1e-5f, 1.0f,
+		    &h, 0);
+		ref_gated_adam(&o, wr, mr_, vr, g, N, 1.0f / 16, 0.02f,
+		    1e-5f, 1.0f, sigr, tg.beta, tg.p, tg.mean_pres != 0);
+		CHECK(memcmp(w, wr, sizeof w) == 0);
+		CHECK(memcmp(m, mr_, sizeof m) == 0);
+		CHECK(memcmp(v, vr, sizeof v) == 0);
+		CHECK(memcmp(sig, sigr, sizeof sig) == 0);
+
+		/* FARO risk: Σ (mix*lr*mh/(sqrt(vh)+eps))², wd excluded. */
+		float want = 0.0f;
+		const float c1 = 1.0f / (1.0f - o.b1t), c2 = 1.0f / (1.0f - o.b2t);
+		for (size_t k = 0; k < N; k++) {
+			float upd = 1.0f * 0.02f *
+			    (mr_[k] * c1 / (fsqrt(vr[k] * c2) + o.eps));
+			want += upd * upd;
+		}
+		CHECK(risk[0] == want);
+	}
+}
+
 int main(void)
 {
 	polynomial();
 	wrappers();
 	profiles_test();
+	hooks_abi();
 	return CHECK_DONE();
 }

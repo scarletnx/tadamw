@@ -445,8 +445,8 @@ static unsigned fit_env_uint(const char *name, unsigned def)
 	return end != s ? (unsigned)v : def;
 }
 
-/* The optimizer wrappers (adam_rows, muon_rows, malt_rows, ns_score) and
- * the single Newton-Schulz polynomial now live in fit_opt.c / fit_opt.h.
+/* The optimizer wrappers (adam_rows, muon_rows, malt_rows) and the single
+ * Newton-Schulz polynomial now live in fit_opt.c / fit_opt.h.
  * Their FP expressions were moved verbatim; see tests/test_fit_opt.c. */
 
 static const char *fit_env_str(const char *name, const char *def)

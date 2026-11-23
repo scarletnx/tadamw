@@ -128,9 +128,13 @@ typedef struct {
 } optcfg;
 
 /* ---- dispatch / hook ABI -----------------------------------------------------
- * These types are the landing slots for the feature PRs. The foundation
- * defines them and passes them through, but implements no PR-specific hook.
+ * ONE ABI for all fitting-side features. The foundation defines the slots and
+ * leaves them NULL on shipped paths; PR #5/#6/#8/#19 supply implementations
+ * instead of editing optimizer branches. tnet is opaque here: its definition
+ * stays in fit_internal.h (shared with the GPU trainer).
  */
+
+struct tnet;
 
 typedef enum {
 	W1_ADAM, W1_MUON, W1_MALT, W1_MALTER, W1_NAMO, W1_NAMOD
@@ -146,10 +150,38 @@ typedef struct {
 	unsigned bid;         /* FARO risk block, 0 when the bank is off */
 } opt_plan;
 
+/* The single step-shaping slot: C3 sign gate (#8) and NAMO_GATE (#6) are
+ * configuration aliases into this, never two implementations. begin() is the
+ * first pass (advance sign EMA, fill the per-weight multiplier bank, apply
+ * mean-preserving normalization); gate() is the second pass (read multiplier
+ * k). eps() is reserved for C2, which staged #8 dropped; NULL when unused. */
 typedef struct {
-	void *ctx; /* feature-private state; NULL on every shipped path */
-	/* PR #5/#6/#8/#19 add risk / step-shape / lifecycle slots here. */
+	void  *ctx;
+	void  (*begin)(void *ctx, const float *g, size_t len, float scale);
+	float (*gate) (void *ctx, size_t k, float gk);
+	float (*eps)  (void *ctx, size_t k, float vh, float dflt);
+} step_shape;
+
+typedef struct {
+	void      *ctx;   /* feature-private state; NULL on shipped paths */
+	step_shape shape; /* the only gate / coordinate-eps slot */
+	float     *risk;  /* FARO bank [nb]; NULL = no accounting */
+	unsigned   nb;    /* bank length (bounds/debug) */
+	void (*pre_step )(void *ctx, struct tnet *, optcfg *, uint64_t step,
+	                  bool tied);
+	void (*pre_set  )(void *ctx, struct tnet *, unsigned layer, unsigned set,
+	                  opt_plan *);
+	void (*post_set )(void *ctx, struct tnet *, unsigned layer, unsigned set,
+	                  size_t off, size_t len, uint64_t step);
+	void (*post_step)(void *ctx, struct tnet *, uint64_t step);
+	void (*finalize) (void *ctx, struct tnet *);
 } opt_hooks;
+
+/* The one sign-consistency gate math, adopted verbatim from staged #8
+ * (exp-eps-gate @ af5fd00, fit.c:544-550). sig is the sign EMA of the raw
+ * gradient gk; the returned multiplier is |sig|^p (p = 1 or 2). Tests use
+ * this directly (0.1 / 0.19 / 0.01 for beta = 0.9). */
+float fit_gate_step(float *sig, float gk, float beta, float p);
 
 /* ---- thin wrappers (fit_opt.c) ---------------------------------------------- */
 
@@ -166,8 +198,8 @@ void malt_rows(const optcfg *o, float *w, float *m, float *l, float *r,
     float lr, float wd, float mix, bool adaptive,
     const opt_hooks *h, unsigned bid);
 
-/* Linearized spectral score of a W1 gradient; prepared for FARO's "lin"
- * statistic. It is just normalize -> ns_ortho -> dot, no fourth NS copy. */
-float ns_score(const optcfg *o, const float *g, unsigned rows, unsigned cols);
+/* No ns_score(): staged FARO @ 09311ce removed the routing lane it served.
+ * If FARO ever restores TAW_FARO_STAT=lin, re-add it as a thin caller of
+ * ns_ortho() rather than a fourth copy of the polynomial. */
 
 #endif
