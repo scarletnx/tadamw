@@ -16,6 +16,33 @@ Two variants share one header and one model section:
 | `.aw`     | 0    | stream: chunks are decoded strictly in order |
 | `.awseek` | 1    | seekable: independent fixed-size blocks + seek index |
 
+## Allocation registry (central ledger)
+
+This is the single source of truth for arithmetic-profile IDs and awseek flag
+bits. It is maintained by the Format Registrar in the `REGISTRY.md` ruling;
+PRs MUST NOT write their own "reserved, refuse" ranges or claim a section
+number for themselves. Section numbers follow the rule *section number =
+profile ID*; profiles 0 and 1 are grandfathered at §2.1/§2.2 and §5.1.
+
+| id / bit | name | owner | canonical section(s) | status on this base |
+|----------|------|-------|----------------------|---------------------|
+| profile 0 | `INT_ORDER0` | upstream | §2.1, §5 (intro note) | implemented |
+| profile 1 | `F32_STRICT_MIX` | upstream | §2.2, §5.1 | implemented, golden-pinned |
+| profile 6 | `CALIBRATED_MIX` | PR #10 | §2.6, §5.6 | allocated, subject to ratification; refuse here |
+| profile 11 | `ENTROPY_GATE` | PR #11 | §2.11, §5.11 | allocated, subject to ratification; refuse here |
+| profile 14 | `HNET_BOUNDARY` | PR #13 | §2.14, §5.14 | allocated, subject to ratification; refuse here |
+| awseek flag bit 1 | variable-length blocks (container only) | PR #15 | §7.2 | allocated, subject to ratification; refuse here |
+| profile 3, 7 | `SOFT_GATED`, `SOFT_GATED_CAL` | PR #12 | — | denied: spec/code mismatch, default-path regression, gain lost under Muon |
+| profile 8 | `PAQ_MIX` | PR #18 | — | held; probationary reservation only, no allocation |
+| profile 10 | `F32_CHAINED_MIX` | PR #17 | — | denied: negative result (3 of 4 cells worse) |
+| profile 12 | `MDL_TREE` | PR #16 | — | denied: default-path change, L1-only; encoder-only knob instead |
+
+Denied and held IDs are recorded so that no PR may describe them as free;
+decoders MUST refuse them until a later ruling allocates them. No quant ID is
+allocated by this ledger: quant ids `5..11` (`Q4`, `Q2`, `FP8`, `NVFP4`,
+`IQ8`, `IQ4`, `IQ2`) stay exactly as specified in §3, and every retained
+profile uses the profile-1 quant set. §2.3 and §5.2 are sealed (see below).
+
 ## 1. File header (32 bytes)
 
 | off | size | field          | notes |
@@ -41,6 +68,10 @@ fall back to a different arithmetic: an archive decodes exactly or not at all.
 
 For awseek, `block_size` MUST be a power of two in `[2^12, 2^30]`.
 
+Flag bit 1 is allocated to PR #15 as a container-only extension (§7.2) and a
+20-byte index-entry layout has been proposed for it, but neither is normative
+on this base: a decoder still refuses flag bit 1 as an unsupported flag.
+
 ## 2. Arithmetic profiles
 
 The profile fixes how the decoder turns model weights and history into
@@ -52,7 +83,16 @@ identical probabilities for every bit.
 |----|-----------------|---------------|--------|
 | 0  | `INT_ORDER0`    | empty (`model_size = 0`, `quant = 0`) | implemented, placeholder |
 | 1  | `F32_STRICT_MIX`| mixer shape and weights, §5.1; quant `F16`, `Q8`, `Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4` or `IQ2` | implemented |
-| 2..255 | — | — | reserved, refuse |
+| 6  | `CALIBRATED_MIX` (PR #10) | §5.6 (allocated placeholder, not normative here) | allocated; refuse until ratified |
+| 11 | `ENTROPY_GATE` (PR #11) | §5.11 (allocated placeholder, not normative here) | allocated; refuse until ratified |
+| 14 | `HNET_BOUNDARY` (PR #13) | §5.14 (allocated placeholder, not normative here) | allocated; refuse until ratified |
+| 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 15..255 | — | — | unknown, denied or held: refuse |
+
+This is the only profile table. IDs `6`, `11` and `14` are allocated to named
+PRs and are therefore **not** inside the reserved range; their normative text
+is not on this base, so a decoder here still refuses them. IDs `3`, `7`, `8`,
+`10` and `12` are denied or held (see the allocation registry) and MUST NOT be
+reclaimed as free. §2.3 and §5.2 are sealed.
 
 ### 2.1 Profile 0: `INT_ORDER0`
 
@@ -306,10 +346,41 @@ and the same `A2` entry are updated: `e += (65535 - e) >> 6` if `b`, else
    `nib = 1` and select lines with `q = c0`. At `bitpos` 8: byte end
    (§2.2.5).
 
+### 2.3 (sealed — profile-1-only)
+
+This subsection number is sealed. It is reserved for profile-1 material only
+and MUST NOT be used to document any other arithmetic profile. Several
+in-flight PRs proposed to add a new profile here; those claims are void. The
+canonical numbers are §2.6, §2.11 and §2.14. See the allocation registry and
+the `REGISTRY.md` ruling.
+
+### 2.6 Profile 6: `CALIBRATED_MIX` (PR #10)
+
+Allocated placeholder. The normative arithmetic is introduced by PR #10 and
+is not part of this base; when that PR lands, its §2.3 text is renumbered to
+§2.6 (and its §5.2 text to §5.6). Until then `arith_profile = 6` is refused.
+See the `REGISTRY.md` ruling.
+
+### 2.11 Profile 11: `ENTROPY_GATE` (PR #11)
+
+Allocated placeholder. Normative text arrives with PR #11 as §2.11 / §5.11.
+Until then `arith_profile = 11` is refused. See the `REGISTRY.md` ruling.
+
+### 2.14 Profile 14: `HNET_BOUNDARY` (PR #13)
+
+Allocated placeholder. PR #13 already uses §2.14; on landing, its model text
+becomes §5.14 rather than an edit to the shared §5.1 validation text. Until
+then `arith_profile = 14` is refused. See the `REGISTRY.md` ruling.
+
 ## 3. Quantization formats
 
 The format in which model weights are stored. Encoders may pick any format
 the profile allows. F16 is the standard format.
+
+Allocation note: no quant ID is added by the registry. Ids `5..11` (`Q4`,
+`Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4`, `IQ2`) and their encodings below are
+unchanged on this base, and every retained profile uses the profile-1 quant
+set (`F16` plus `Q8`..`IQ2`). Quant ids `12..255` stay reserved, refuse.
 
 | id | name | encoding |
 |----|------|----------|
@@ -443,6 +514,30 @@ A decoder needs about `10 * 2^L * 64 + 2^HB + 4 * 2^MB` bytes of tables
 plus about 4.6 MB fixed (o1 table and APM), and resets them per coding
 unit.
 
+### 5.2 (sealed — profile-1-only)
+
+This subsection number is sealed and reserved for profile-1 material; it
+MUST NOT be used for any other profile's model section. New profiles use
+§5.6, §5.11 and §5.14. See the allocation registry and the `REGISTRY.md`
+ruling.
+
+### 5.6 Profile 6 model (PR #10)
+
+Allocated placeholder; the 16-byte head and payload arrive with PR #10.
+Refused on this base. See the `REGISTRY.md` ruling.
+
+### 5.11 Profile 11 model (PR #11)
+
+Allocated placeholder; the 4-byte gate tail arrives with PR #11. Refused on
+this base. See the `REGISTRY.md` ruling.
+
+### 5.14 Profile 14 model (PR #13)
+
+Allocated placeholder. Profile 14 reuses the §5.1 head and row encodings with
+row width 27 instead of 26; that deviation is specified here when PR #13
+lands, not by editing the shared §5.1 checks. Refused on this base. See the
+`REGISTRY.md` ruling.
+
 ## 6. aw body (kind 0)
 
 A sequence of chunks follows the model section:
@@ -491,6 +586,11 @@ Index:
 the entries are followed by the file directory (§7.1), still inside the index
 and covered by `index_crc`.
 
+The 16-byte entry above is the normative version-1 layout. A 20-byte entry
+adding `u32 raw_len` behind awseek flag bit 1 (allocated to PR #15, §7.2) is a
+**proposed extension**, not part of this document: a decoder on this base
+MUST refuse flag bit 1 rather than parse such an index.
+
 Footer (the last 16 bytes of the file):
 
 | size | field |
@@ -522,3 +622,10 @@ Rules (a decoder MUST refuse a directory that breaks one):
 - The directory must end exactly where the footer starts.
 
 Bytes outside every file are allowed but carry no name.
+
+### 7.2 Variable-length blocks (PR #15)
+
+Allocated placeholder for a container-only extension: awseek flag bit 1 and
+20-byte index entries carrying `raw_len`. It is not normative on this base;
+the flag remains refused and the index remains 16-byte (§7). See the
+allocation registry and the `REGISTRY.md` ruling.
