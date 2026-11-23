@@ -485,8 +485,12 @@ static unsigned fit_env_uint(const char *name, unsigned def)
 
 /* AdamW on a flat vector. `mix` scales the whole update (1 for plain AdamW,
  * 1-alpha for the Adam half of a blend). Gradients are cleared by caller. */
+/* `risk` (FARO only) accumulates the squared applied update of block `bid`;
+ * NULL keeps the shipped update bit-for-bit. The w update itself is never
+ * rewritten: the extra multiply is done separately, so rounding is unchanged. */
 static void adam_rows(optcfg *o, float *w, float *m, float *v, const float *g,
-    size_t len, float scale, float lr, float wd, float mix)
+    size_t len, float scale, float lr, float wd, float mix, float *risk,
+    unsigned bid)
 {
 	const float c1 = 1.0f / (1.0f - o->b1t), c2 = 1.0f / (1.0f - o->b2t);
 	for (size_t k = 0; k < len; k++) {
@@ -495,13 +499,18 @@ static void adam_rows(optcfg *o, float *w, float *m, float *v, const float *g,
 		v[k] = o->b2 * v[k] + (1.0f - o->b2) * gk * gk;
 		float mh = m[k] * c1, vh = v[k] * c2;
 		w[k] -= mix * lr * (mh / (fsqrt(vh) + o->eps) + wd * w[k]);
+		if (risk) {
+			float upd = mix * lr * (mh / (fsqrt(vh) + o->eps));
+			risk[bid] += upd * upd; /* decoupled wd is not part of Δ_b */
+		}
 	}
 }
 
 /* Muon on a row-major rows x cols matrix. Largest shape here is
  * P1_HMAX x P1_F = 32 x 26, so scratch fits on the stack. */
 static void muon_rows(const optcfg *o, float *w, float *m, const float *g,
-    size_t rows, size_t cols, float scale, float lr, float wd, float mix)
+    size_t rows, size_t cols, float scale, float lr, float wd, float mix,
+    float *risk, unsigned bid)
 {
 	float x[MUON_MAXEL], a[MUON_MAXEL], b[MUON_MAXEL], y[MUON_MAXEL];
 	const bool tr = rows > cols; /* work with the shorter dimension first */
@@ -553,6 +562,10 @@ static void muon_rows(const optcfg *o, float *w, float *m, const float *g,
 	for (size_t i = 0; i < rows * cols; i++) {
 		size_t at = tr ? (i % cols) * mc + i / cols : i;
 		w[i] -= factor * x[at] + mix * lr * wd * w[i];
+		if (risk) {
+			float upd = factor * x[at];
+			risk[bid] += upd * upd; /* only the geometry-induced Δ_b */
+		}
 	}
 }
 
@@ -575,7 +588,7 @@ static inline float inv_root8(float x)
  * Orthogonalization reuses Muon's Newton-Schulz polynomial. */
 static void malt_rows(const optcfg *o, float *w, float *m, float *l, float *r,
     float *nu, const float *g, size_t rows, size_t cols, float scale,
-    float lr, float wd, float mix, bool adaptive)
+    float lr, float wd, float mix, bool adaptive, float *risk, unsigned bid)
 {
 	float x[MUON_MAXEL], a[MUON_MAXEL], b[MUON_MAXEL], y[MUON_MAXEL];
 	float Lc[MUON_MAXDIM], Rc[MUON_MAXDIM];
@@ -688,6 +701,10 @@ static void malt_rows(const optcfg *o, float *w, float *m, float *l, float *r,
 			const size_t idx = i * cols + j;
 			const size_t at = tr ? j * mc + i : idx;
 			w[idx] -= fac * x[at] + mix * lr * wd * w[idx];
+			if (risk) { /* FARO: update-to-weight risk, wd excluded */
+				float upd = fac * x[at];
+				risk[bid] += upd * upd;
+			}
 		}
 	}
 }
@@ -696,6 +713,427 @@ static const char *fit_env_str(const char *name, const char *def)
 {
 	const char *s = getenv(name);
 	return s && *s ? s : def;
+}
+
+/* ---- FARO: function-space adaptive return-to-risk allocation -----------------
+ *
+ * An opt-in, encoder-only approximation of arXiv:2610.40858. Two decisions on
+ * the fitted mixer's parameter blocks (W1 matrices = spectral/Muon candidate,
+ * W2 vectors = coordinate/AdamW candidate):
+ *
+ *   route  - during a short post-untie exploration, compare the two candidate
+ *            geometries on a deterministic in-batch probe and freeze after
+ *            un-tie. Default (TAW_FARO_STAT=probe): apply each geometry's real
+ *            update to a shadow copy of the block and score the one-step loss
+ *            decrease in bits (Eq. 1). TAW_FARO_STAT=lin uses the cheaper
+ *            first-order proxy ||g||_1/sqrt(N) vs <g, NS(g)>/||NS(g)||_F,
+ *            both per unit update (Appendix G's linearized return).
+ *   alloc  - after the freeze, per-block risk is the EWMA of the update-to-
+ *            weight ratio ||Δ_b|| / (||θ_b|| + eps), measured on the *previous*
+ *            step. Winsorize against the cross-block median, then solve
+ *            Λ(λ) = Σ β̄_b clip(λ / r̃_b, 1/c, c) = Σ β̄_b by bisection and
+ *            apply μ_b = clip(λ/r̃_b, 1/c, c) to the block's LR. Total budget
+ *            is preserved exactly (up to the optional μ clamp).
+ *
+ * The paper's counterfactual uses a disjoint held-out probe shard and follows
+ * the full training trajectory; here the probe is in-batch, one step long, and
+ * only W1 has a second candidate geometry. See RESULTS.md: this approximation
+ * does not recover the hand-designed Muon route, so the ERC lane is the part
+ * that is validated here.
+ */
+typedef struct {
+	bool on, route_ret, alloc, frozen, debug;
+	bool blocks_set;   /* false: 2 layer blocks, true: one block per set */
+	int stat;          /* 0 = probe loss (default), 1 = linearized return */
+	unsigned explore;  /* post-untie batches spent measuring returns */
+	int nb, nw1;       /* total blocks, W1 blocks (first nw1) */
+	uint64_t untie_step, freeze_step;
+	float gam, kappa, cap, floor, ceilv;
+	float *usum;       /* Σ Δ² accumulated in the current step, [nb] */
+	float *risk;       /* pointer to usum while allocating, else NULL */
+	float *r;          /* risk EWMA [nb] */
+	float *mu;         /* budget multiplier [nb] */
+	float *scratch;    /* [3*nb]: median, winsorized risk, reference budgets */
+	float *ret0, *ret1;/* coordinate vs spectral return [nw1] */
+	float *wtmp, *da0, *da1; /* shadow update scratch [P1_HMAX*P1_F] */
+	uint8_t *geo;      /* 1 = Muon/spectral, 0 = Adam/coordinate [nw1] */
+} faro_ctx;
+
+static inline int faro_b1(const faro_ctx *f, unsigned set)
+{
+	return f->blocks_set ? (int)set : 0;
+}
+
+static inline int faro_b2(const faro_ctx *f, unsigned set)
+{
+	return f->blocks_set ? (int)(f->nw1 + set) : 1;
+}
+
+static void faro_free(faro_ctx *f)
+{
+	free(f->usum); free(f->r); free(f->mu); free(f->scratch);
+	free(f->ret0); free(f->ret1); free(f->geo);
+	free(f->wtmp); free(f->da0); free(f->da1);
+	memset(f, 0, sizeof *f);
+}
+
+static void faro_init(faro_ctx *f, const tnet *t, int epochs, size_t ns)
+{
+	memset(f, 0, sizeof *f);
+	const char *on = fit_env_str("TAW_FARO", "0");
+	if (strcmp(on, "1") && strcmp(on, "on") && strcmp(on, "yes") &&
+	    strcmp(on, "true"))
+		return;
+	const char *route = fit_env_str("TAW_FARO_ROUTE", "ret");
+	f->alloc = strcmp(fit_env_str("TAW_FARO_ALLOC", "erc"), "none") != 0;
+	f->route_ret = strcmp(route, "ret") == 0;
+	f->stat = strcmp(fit_env_str("TAW_FARO_STAT", "probe"), "lin") == 0;
+	f->debug = fit_env_uint("TAW_FARO_DEBUG", 0) != 0;
+	f->blocks_set = strcmp(fit_env_str("TAW_FARO_BLOCKS", "set"), "layer") != 0;
+	f->nw1 = f->blocks_set ? (int)t->s1 : (t->s1 ? 1 : 0);
+	f->nb = f->blocks_set ? (int)(t->s1 + t->s2) : (t->n1 ? 2 : 1);
+	if (f->nb < 1 || f->nb > 8192)
+		return;
+	if (!f->route_ret) /* forced muon/adam: nothing to measure */
+		f->explore = 0;
+	else
+		f->explore = fit_env_uint("TAW_FARO_EXPLORE", 20);
+	f->gam = fit_env_float("TAW_FARO_GAMMA", 0.9f);
+	f->kappa = fit_env_float("TAW_FARO_KAPPA", 3.0f);
+	f->cap = fit_env_float("TAW_FARO_CAP", 1.4f);
+	f->floor = fit_env_float("TAW_FARO_FLOOR", 0.5f);
+	f->ceilv = fit_env_float("TAW_FARO_CEIL", 2.0f);
+	if (f->gam < 0.0f || f->gam >= 1.0f) f->gam = 0.9f;
+	if (f->kappa < 1.0f) f->kappa = 3.0f;
+	if (f->cap < 1.0f) f->cap = 1.4f;
+	if (f->floor <= 0.0f) f->floor = 1.0f / f->cap;
+	if (f->ceilv < 1.0f) f->ceilv = f->cap;
+	f->untie_step = (uint64_t)fit_warm_epochs(epochs) *
+	    ((ns + FIT_BATCH - 1) / FIT_BATCH);
+	f->freeze_step = f->untie_step + f->explore;
+	f->usum = calloc((size_t)f->nb, sizeof *f->usum);
+	f->r = calloc((size_t)f->nb, sizeof *f->r);
+	f->mu = malloc((size_t)f->nb * sizeof *f->mu);
+	f->scratch = malloc(3u * (size_t)f->nb * sizeof *f->scratch);
+	f->ret0 = calloc((size_t)(f->nw1 ? f->nw1 : 1), sizeof *f->ret0);
+	f->ret1 = calloc((size_t)(f->nw1 ? f->nw1 : 1), sizeof *f->ret1);
+	f->geo = malloc((size_t)(f->nw1 ? f->nw1 : 1));
+	const size_t nw = (size_t)P1_HMAX * P1_F;
+	f->wtmp = malloc(nw * sizeof *f->wtmp);
+	f->da0 = malloc(nw * sizeof *f->da0);
+	f->da1 = malloc(nw * sizeof *f->da1);
+	if (!f->usum || !f->r || !f->mu || !f->scratch || !f->ret0 ||
+	    !f->ret1 || !f->geo || !f->wtmp || !f->da0 || !f->da1) {
+		faro_free(f);
+		return;
+	}
+	for (int b = 0; b < f->nb; b++)
+		f->mu[b] = 1.0f; /* identity until the freeze */
+	/* The forced arms pick their geometry up front. */
+	for (int b = 0; b < f->nw1; b++)
+		f->geo[b] = (uint8_t)(strcmp(route, "adam") != 0);
+	f->on = true;
+}
+
+/* Linearized return of the spectral candidate on one W1 matrix: <g, NS(g)>
+ * divided by ||NS(g)||_F. Duplicates Muon's Newton-Schulz loop (only used with
+ * FARO enabled) so the shipped muon_rows stays byte-identical. */
+static float faro_ns_score(const optcfg *o, const float *g, unsigned rows,
+    unsigned cols)
+{
+	float x[MUON_MAXEL], a[MUON_MAXEL], b[MUON_MAXEL], y[MUON_MAXEL];
+	const size_t n = (size_t)rows * cols;
+	if (n > MUON_MAXEL || !n)
+		return 0.0f;
+	const bool tr = rows > cols;
+	const size_t mr = tr ? cols : rows, mc = tr ? rows : cols;
+	for (size_t i = 0; i < n; i++) {
+		size_t at = tr ? (i % cols) * mc + i / cols : i;
+		x[at] = g[i];
+	}
+	float ss = 0.0f;
+	for (size_t i = 0; i < n; i++)
+		ss += x[i] * x[i];
+	if (!(ss > 1e-12f))
+		return 0.0f;
+	float inv = 1.0f / fsqrt(ss);
+	for (size_t i = 0; i < n; i++)
+		x[i] *= inv;
+	for (unsigned it = 0; it < o->ns_steps; it++) {
+		for (size_t i = 0; i < mr; i++)
+			for (size_t j = 0; j < mr; j++) {
+				float s = 0.0f;
+				for (size_t k = 0; k < mc; k++)
+					s += x[i * mc + k] * x[j * mc + k];
+				a[i * mr + j] = s;
+			}
+		for (size_t i = 0; i < mr; i++)
+			for (size_t j = 0; j < mr; j++) {
+				float s = 0.0f;
+				for (size_t k = 0; k < mr; k++)
+					s += a[i * mr + k] * a[k * mr + j];
+				b[i * mr + j] = -4.7750f * a[i * mr + j] + 2.0315f * s;
+			}
+		for (size_t i = 0; i < mr; i++)
+			for (size_t k = 0; k < mc; k++) {
+				float s = 0.0f;
+				for (size_t j = 0; j < mr; j++)
+					s += b[i * mr + j] * x[j * mc + k];
+				y[i * mc + k] = s;
+			}
+		for (size_t i = 0; i < n; i++)
+			x[i] = 3.4445f * x[i] + y[i];
+	}
+	double dot = 0.0, xn = 0.0;
+	for (size_t i = 0; i < n; i++) {
+		size_t at = tr ? (i % cols) * mc + i / cols : i;
+		dot += (double)g[i] * x[at];
+		xn += (double)x[at] * x[at];
+	}
+	return xn > 0.0 ? (float)(dot / (double)fsqrt((float)xn)) : 0.0f;
+}
+
+/* Both scores are per-unit-update: ||g||_1/sqrt(N) is the RMS absolute
+ * gradient (coordinate geometry), the other the mean singular value. */
+static void faro_explore(faro_ctx *f, const optcfg *o, const float *g,
+    int b, unsigned H)
+{
+	if (b < 0 || b >= f->nw1)
+		return;
+	double l1 = 0.0;
+	const size_t n = (size_t)H * P1_F;
+	for (size_t i = 0; i < n; i++) {
+		float v = g[i];
+		l1 += v < 0.0f ? -v : v;
+	}
+	f->ret0[b] += (float)l1 / fsqrt((float)n);
+	f->ret1[b] += faro_ns_score(o, g, H, P1_F);
+}
+
+/* Forward-only cost of one probe sample, in the same bits the fitter uses.
+ * Samples routed to another W1 set are skipped so the return stays per-block. */
+static double faro_probe_loss(const tnet *t, const sample *s, unsigned set)
+{
+	const unsigned H = t->s.hidden;
+	const p1_sel_ctx sc = sample_sc(s);
+	if (!t->tied && p1_sel_value(t->s.sel1, &sc) != set)
+		return 0.0;
+	float x[P1_XPAD];
+	sample_x(s, x);
+	const uint32_t s2 = t->tied ? 0 : p1_sel_value(t->s.sel2, &sc);
+	const float *w2 = t->w + t->n1 + (size_t)s2 * t->row2;
+	float z = 0.0f;
+	if (H) {
+		const float *w1 = t->w + (size_t)set * t->row1;
+		for (unsigned j = 0; j < H; j++) {
+			float acc = 0.0f;
+			const float *r = w1 + j * P1_F;
+			for (unsigned i = 0; i < P1_F; i++)
+				acc += r[i] * x[i];
+			z += w2[j] * clamp8(acc);
+		}
+		z += w2[H];
+	} else {
+		for (unsigned i = 0; i < P1_F; i++)
+			z += w2[i] * x[i];
+	}
+	const float lim = 2047.0f / 256.0f;
+	float zc = z > lim ? lim : z < -lim ? -lim : z;
+	uint32_t p = p1_squash((int32_t)(zc * 256.0f));
+	const float *ct = cost_tab();
+	if (!ct)
+		return 0.0;
+	unsigned idx = s->bit ? p : 65536u - p;
+	if (idx > 65535)
+		idx = 65535;
+	return ct[idx];
+}
+
+/* Eq. (1) on the collected samples: apply each candidate geometry's real
+ * update to a shadow copy of this block, measure the probe loss change, undo.
+ * The two states are copied, so exploration never perturbs the training path. */
+static void faro_cf_probe(faro_ctx *f, tnet *t, const optcfg *o, unsigned set,
+    const float *g, float scale, const sample *const *probe, size_t nprobe)
+{
+	int b = faro_b1(f, set);
+	if (b < 0 || b >= f->nw1 || !t->s.hidden)
+		return;
+	const size_t len = (size_t)t->s.hidden * P1_F;
+	const size_t off = (size_t)set * t->row1;
+	float ms[P1_HMAX * P1_F], m1s[P1_HMAX * P1_F], vs[P1_HMAX * P1_F];
+	float ws[P1_HMAX * P1_F];
+	if (len > sizeof ms / sizeof *ms)
+		return;
+	memcpy(ms, t->m + off, len * sizeof *ms);
+	memcpy(m1s, t->m1 + off, len * sizeof *m1s);
+	memcpy(vs, t->v1 + off, len * sizeof *vs);
+	memcpy(ws, t->w + off, len * sizeof *ws);
+	memset(f->wtmp, 0, len * sizeof *f->wtmp);
+	muon_rows(o, f->wtmp, ms, g, t->s.hidden, P1_F, scale, o->lr, 0.0f,
+	    1.0f, nullptr, 0);
+	memcpy(f->da1, f->wtmp, len * sizeof *f->da1); /* -Δ spectral */
+	memset(f->wtmp, 0, len * sizeof *f->wtmp);
+	optcfg local = *o; /* adam_rows takes a mutable cfg; keep o const */
+	adam_rows(&local, f->wtmp, m1s, vs, g, len, scale, o->lr1, 0.0f, 1.0f,
+	    nullptr, 0);
+	memcpy(f->da0, f->wtmp, len * sizeof *f->da0); /* -Δ coordinate */
+	double before = 0.0;
+	for (size_t k = 0; k < nprobe; k++)
+		before += faro_probe_loss(t, probe[k], set);
+	for (int cand = 0; cand < 2; cand++) {
+		const float *da = cand ? f->da1 : f->da0;
+		for (size_t i = 0; i < len; i++)
+			t->w[off + i] += da[i]; /* wtmp holds -Δ, so += applies Δ */
+		double after = 0.0;
+		for (size_t k = 0; k < nprobe; k++)
+			after += faro_probe_loss(t, probe[k], set);
+		if (cand)
+			f->ret1[b] += (float)(before - after);
+		else
+			f->ret0[b] += (float)(before - after);
+		memcpy(t->w + off, ws, len * sizeof *ws);
+	}
+}
+
+static void faro_freeze(faro_ctx *f)
+{
+	const char *route = fit_env_str("TAW_FARO_ROUTE", "ret");
+	for (int b = 0; b < f->nw1; b++)
+		f->geo[b] = (uint8_t)(strcmp(route, "adam") == 0 ? 0 :
+		    strcmp(route, "muon") == 0 ? 1 : f->ret1[b] >= f->ret0[b]);
+	f->frozen = true;
+	if (f->debug) {
+		fprintf(stderr, "FARO: frozen at step %llu, blocks %d/%d\n",
+		    (unsigned long long)f->freeze_step, f->nw1, f->nb);
+		for (int b = 0; b < f->nw1; b++)
+			fprintf(stderr, "FARO: W1 block %d return coord=%.9g "
+			    "spectral=%.9g -> %s\n", b, f->ret0[b], f->ret1[b],
+			    f->geo[b] ? "spectral" : "coordinate");
+	}
+}
+
+/* Update-to-weight ratio from the applied Δ and the current weights. The
+ * allocation at step t only ever reads r(t-1), so no gradient leaks into its
+ * own budget. */
+static void faro_measure(faro_ctx *f, const tnet *t)
+{
+	for (int b = 0; b < f->nb; b++) {
+		const float *w;
+		size_t len;
+		if (f->blocks_set && b >= f->nw1) {
+			size_t set = (size_t)(b - f->nw1);
+			w = t->w + t->n1 + set * t->row2;
+			len = t->row2;
+		} else if (f->blocks_set) {
+			w = t->w + (size_t)b * t->row1;
+			len = t->row1;
+		} else if (b == 0) {
+			w = t->w;
+			len = t->n1;
+		} else {
+			w = t->w + t->n1;
+			len = t->n2;
+		}
+		double sw = 0.0;
+		for (size_t i = 0; i < len; i++)
+			sw += (double)w[i] * w[i];
+		float uwr = fsqrt(f->usum[b]) / (fsqrt((float)sw) + 1e-6f);
+		f->r[b] = f->r[b] > 0.0f ? f->gam * f->r[b] + (1.0f - f->gam) * uwr
+					 : uwr;
+		f->usum[b] = 0.0f;
+	}
+}
+
+static double faro_lambda_of(double lam, int nb, const float *rt,
+    const float *ref, double invc, double cap)
+{
+	double s = 0.0;
+	for (int b = 0; b < nb; b++) {
+		double u = lam / (double)rt[b];
+		if (u < invc) u = invc;
+		if (u > cap) u = cap;
+		s += (double)ref[b] * u;
+	}
+	return s;
+}
+
+/* Cross-block ERC, Algorithm 1 of the paper: winsorized risk, capped
+ * multiplier, budget-neutral bisection. β̄_b is the block's reference LR. */
+static void faro_allocate(faro_ctx *f, const optcfg *o)
+{
+	float *med = f->scratch, *rt = f->scratch + f->nb;
+	float *ref = f->scratch + 2 * f->nb;
+	for (int b = 0; b < f->nb; b++)
+		med[b] = f->r[b];
+	for (int i = 1; i < f->nb; i++) { /* insertion sort, nb is tiny */
+		float v = med[i];
+		int j = i;
+		while (j && med[j - 1] > v) {
+			med[j] = med[j - 1];
+			j--;
+		}
+		med[j] = v;
+	}
+	const float m = med[f->nb / 2];
+	double bud = 0.0;
+	for (int b = 0; b < f->nb; b++) {
+		bool is_w1 = f->blocks_set ? b < f->nw1 : b == 0;
+		ref[b] = is_w1 ? (f->geo && f->geo[b] ? o->lr : o->lr1) : o->lrvec;
+		bud += ref[b];
+		float lo = m > 0.0f ? m / f->kappa : 1.0f;
+		float hi = m > 0.0f ? m * f->kappa : 1.0f;
+		rt[b] = f->r[b] < lo ? lo : f->r[b] > hi ? hi : f->r[b];
+	}
+	if (!(bud > 0.0))
+		return;
+	const double c = f->cap, invc = 1.0 / c;
+	double lo = 0.0, hi = (double)rt[0] * c * 2.0;
+	for (int b = 1; b < f->nb; b++) {
+		double t = (double)rt[b] * c * 2.0;
+		if (t > hi) hi = t;
+	}
+	while (faro_lambda_of(hi, f->nb, rt, ref, invc, c) < bud && hi < 1e30)
+		hi *= 2.0;
+	for (int it = 0; it < 48; it++) {
+		double mid = 0.5 * (lo + hi);
+		if (faro_lambda_of(mid, f->nb, rt, ref, invc, c) < bud)
+			lo = mid;
+		else
+			hi = mid;
+	}
+	const double lam = 0.5 * (lo + hi);
+	for (int b = 0; b < f->nb; b++) {
+		double u = lam / (double)rt[b];
+		if (u < invc) u = invc;
+		if (u > c) u = c;
+		if (u < f->floor) u = f->floor;
+		if (u > f->ceilv) u = f->ceilv;
+		f->mu[b] = (float)u;
+	}
+	if (f->debug) { /* neutrality diagnostic: Σ β̄ μ should equal Σ β̄ */
+		double chk = 0.0;
+		for (int b = 0; b < f->nb; b++)
+			chk += (double)ref[b] * f->mu[b];
+		double err = chk - bud;
+		if (err < 0.0) err = -err;
+		if (err > 1e-4 * bud)
+			fprintf(stderr, "FARO: budget drift %.3g / %.3g\n", err, bud);
+	}
+}
+
+static void faro_report(const faro_ctx *f)
+{
+	if (!f->on || !f->debug)
+		return;
+	float lo = 1.0f, hi = 1.0f;
+	for (int b = 0; b < f->nb; b++) {
+		if (f->mu[b] < lo) lo = f->mu[b];
+		if (f->mu[b] > hi) hi = f->mu[b];
+	}
+	fprintf(stderr, "FARO: final multiplier range %.4g..%.4g, risks:", lo, hi);
+	for (int b = 0; b < f->nb; b++)
+		fprintf(stderr, " %.4g", f->r[b]);
+	fprintf(stderr, "\n");
 }
 
 /* Train on samples for the given epochs. Batches touch few weight sets, so
@@ -762,6 +1200,8 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 	const bool alt_step = strcmp(fit_env_str("TAW_ALT", "step"), "half") != 0;
 	const bool alt_first_muon =
 	    strcmp(fit_env_str("TAW_ALT_FIRST", "muon"), "adam") != 0;
+	faro_ctx fr;
+	faro_init(&fr, t, epochs, ns);
 
 	/* Per-set frequency for routing: count the same samples the epoch loop
 	 * strides through (order does not matter for a count). */
@@ -818,8 +1258,15 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 		for (size_t done = 0; done < ns;) {
 			size_t nb = ns - done < BATCH ? ns - done : BATCH;
 			size_t n1 = 0, n2 = 0;
+			/* Deterministic probe slice within this batch: 16 strided
+			 * samples, used only for counterfactual return measurement. */
+			const sample *probe[16];
+			size_t nprobe = 0;
+			const size_t pevery = (nb + 15) / 16;
 			for (size_t k = 0; k < nb; k++) {
 				const sample *s = &sm[pos];
+				if (fr.on && pevery && k % pevery == 0 && nprobe < 16)
+					probe[nprobe++] = s;
 				pos += stride;
 				if (pos >= ns)
 					pos %= ns;
@@ -855,6 +1302,13 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 			if (!alt_first_muon)
 				alt_muon = !alt_muon;
 			const float scale = 1.0f / (float)nb;
+			/* FARO: geometry routes settle after the untie + exploration
+			 * window; the ERC solve only reads the previous step's risk. */
+			if (fr.on && !t->tied && !fr.frozen && step >= fr.freeze_step)
+				faro_freeze(&fr);
+			if (fr.on && fr.frozen && fr.alloc)
+				faro_allocate(&fr, &o);
+			fr.risk = fr.on && fr.frozen && fr.alloc ? fr.usum : nullptr;
 			for (size_t k = 0; k < n1; k++) {
 				size_t set = t->list1[k], off = set * t->row1;
 				bool muon = mode == HYB_MUON ||
@@ -862,43 +1316,80 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 				    (mode == HYB_ROUTE && t->route1[set]);
 				if (t->tied && warm_adam)
 					muon = false;
+				int fb = fr.on ? faro_b1(&fr, (unsigned)set) : 0;
+				float lr_w1 = o.lr, lr_a1 = o.lr1;
+				if (fr.on) {
+					lr_w1 *= fr.mu[fb];
+					lr_a1 *= fr.mu[fb];
+					if (!t->tied && mode == HYB_MUON) {
+						if (!fr.frozen && fr.route_ret) {
+							/* alternate candidates to measure returns */
+							if (fr.stat == 0)
+								faro_cf_probe(&fr, t, &o,
+								    (unsigned)set,
+								    t->g + off, scale,
+								    probe, nprobe);
+							else
+								faro_explore(&fr, &o,
+								    t->g + off, fb, H);
+							muon = (step & 1) != 0;
+						} else if (fr.frozen) {
+							muon = fr.geo[fb] != 0;
+						}
+					}
+				}
+				unsigned bid = fr.on ? (unsigned)fb : 0;
 				if (mode == HYB_ADAM) {
 					/* The shipped path, using the original m/v. */
+					float lrvec_w1 = o.lrvec;
+					if (fr.on)
+						lrvec_w1 *= fr.mu[fb];
 					adam_rows(&o, t->w + off, t->m + off,
 					    t->v + off, t->g + off, t->row1,
-					    scale, o.lrvec, o.vecwd, 1.0f);
+					    scale, lrvec_w1, o.vecwd, 1.0f,
+					    fr.risk, bid);
 				} else if (malty && !(t->tied && warm_adam)) {
 					malt_rows(&o, t->w + off, t->m + off,
 					    t->malt_l + set * H,
 					    t->malt_r + set * P1_F,
 					    t->malt_nu + set, t->g + off,
-					    H, P1_F, scale, o.lr, o.wd, 1.0f,
-					    mode == HYB_MALTER);
+					    H, P1_F, scale, lr_w1, o.wd, 1.0f,
+					    mode == HYB_MALTER, fr.risk, bid);
 				} else if (mode == HYB_BLEND) {
 					adam_rows(&o, t->w + off, t->m1 + off,
 					    t->v1 + off, t->g + off, t->row1,
-					    scale, o.lr1, o.wd1, 1.0f - alpha);
+					    scale, lr_a1, o.wd1, 1.0f - alpha,
+					    fr.risk, bid);
 					muon_rows(&o, t->w + off, t->m + off,
-					    t->g + off, H, P1_F, scale, o.lr,
-					    o.wd, alpha);
+					    t->g + off, H, P1_F, scale, lr_w1,
+					    o.wd, alpha, fr.risk, bid);
 				} else if (muon) {
 					muon_rows(&o, t->w + off, t->m + off,
-					    t->g + off, H, P1_F, scale, o.lr,
-					    o.wd, 1.0f);
+					    t->g + off, H, P1_F, scale, lr_w1,
+					    o.wd, 1.0f, fr.risk, bid);
 				} else {
 					adam_rows(&o, t->w + off, t->m1 + off,
 					    t->v1 + off, t->g + off, t->row1,
-					    scale, o.lr1, o.wd1, 1.0f);
+					    scale, lr_a1, o.wd1, 1.0f,
+					    fr.risk, bid);
 				}
 				t->touched1[set] = 0;
 			}
 			for (size_t k = 0; k < n2; k++) {
-				size_t off = t->n1 + t->list2[k] * t->row2;
+				size_t set = t->list2[k];
+				size_t off = t->n1 + set * t->row2;
+				int fb = fr.on ? faro_b2(&fr, (unsigned)set) : 0;
+				float lrvec_b = o.lrvec;
+				if (fr.on)
+					lrvec_b *= fr.mu[fb];
 				adam_rows(&o, t->w + off, t->m + off, t->v + off,
-				    t->g + off, t->row2, scale, o.lrvec,
-				    o.vecwd, 1.0f);
-				t->touched2[t->list2[k]] = 0;
+				    t->g + off, t->row2, scale, lrvec_b,
+				    o.vecwd, 1.0f, fr.risk,
+				    fr.on ? (unsigned)fb : 0);
+				t->touched2[set] = 0;
 			}
+			if (fr.on && fr.frozen && fr.alloc)
+				faro_measure(&fr, t);
 			memset(t->g, 0, (t->n1 + t->n2) * sizeof(float));
 		}
 	}
@@ -923,6 +1414,8 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 		    lmin, lmax, lsum / (float)(H ? H : 1), rmin, rmax,
 		    rsum / (float)P1_F, t->malt_nu[0]);
 	}
+	faro_report(&fr);
+	faro_free(&fr);
 }
 
 /* ---- quantization / serialization -------------------------------------------- */

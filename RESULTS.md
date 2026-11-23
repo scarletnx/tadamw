@@ -172,3 +172,278 @@ the leader's small W2 LR.
   implemented there. Memory overhead is `O(m+n)` extra floats per matrix,
   plus one scalar for MALTER; compute is one NS pass plus row/column sums,
   i.e. essentially Muon's cost.
+
+---
+
+# FARO on the fitted mixer (branch `exp/faro`, rebased onto `origin/main` 1aa3dd7)
+
+The section above is upstream's MALT/MALTER report from merged PR #3, preserved
+verbatim by the rebase. This section is the unique FARO delta (PR #5); it is an
+independent opt-in and coexists with upstream's Muon and MALTER code — no
+duplicate Muon implementation was introduced.
+
+FARO reference point after the rebase is the tuned-Muon recipe (total
+**1,095,864 B**), i.e. the same A/B baseline used in the FARO experiments;
+the new main's MALTER leader (1,093,945 B) is a different opt-in arm and is
+not used as the FARO control. Encoder-only changes in `src/fit.c`; format,
+decoder, quantization, golden vectors and the GPU trainer are untouched.
+Corpora in `/tmp/opencode/tadamw-bench` were read only; all archives live in
+`bench/arcs/` here. Pushed to `myfork exp/faro` only; upstream untouched.
+
+## TL;DR / verdict
+
+**The allocation lane works; the routing lane does not.** With each block's
+geometry forced to the tuned recipe (W1 = Muon, W2 = AdamW) and only the
+cross-block equal-risk-contribution (ERC) budget reallocation enabled, four
+archive sizes improve together:
+
+```
+TAW_HYBRID=muon TAW_MUON_LR0=0.055 TAW_MUON_LR1=0.0011 \
+TAW_VEC_LR0=0.003 TAW_VEC_LR1=0.00015 \
+TAW_FARO=1 TAW_FARO_ROUTE=muon TAW_FARO_CAP=1.8
+```
+
+| corpus / level | shipped | tuned AdamW | tuned Muon (FARO-Adaptive) | **Muon + FARO-ERC c=1.8** | Δ vs tuned Muon |
+|---|---:|---:|---:|---:|---:|
+| text1m L1 | 181557 | 179913 | 179678 | **179502** | −176 |
+| text1m L5 | 179166 | 178886 | 177816 | **177738** | −78 |
+| libc1m L1 | 379197 | 373887 | 371373 | **371208** | −165 |
+| libc1m L5 | 375291 | 371894 | 366997 | **366890** | −107 |
+| **sum L1+L5** | 1,115,211 | 1,104,580 | 1,095,864 | **1,095,338** | **−526 (−0.048 %)** |
+
+That is a **4/4 cell win** on the deterministic benchmark, with no change to
+model size (608 B) or decode path. The paper's claim that FARO-ERC improves a
+near-optimal hand-designed recipe therefore transfers to this fitter, at a much
+smaller scale (0.048 % vs −0.0136 nats). The gain is modest but systematic
+across corpora and levels; the cap sweep has a flat optimum at 1.5–1.8.
+
+`FARO-Adaptive` (routing forced, ERC off) is **byte-identical** to the tuned
+Muon control (all four archives verified with `cmp`, including against sibling
+`exp-muon-adam`'s `muon_055_lowfin_*`). With `TAW_FARO` unset the whole build is
+bit-identical to branch base.
+
+## Paper summary (arXiv:2610.40858, Wu et al., 2026)
+
+FARO makes the *parameter block* the unit of optimizer decision and separates
+two choices:
+
+1. **Routing (return side).** Partition parameters into blocks (B = 117 in the
+   paper). For each block b and candidate geometry φ ∈ {coordinate,
+   row_column, spectral} — Adam-style, row/column-rescaled matrix, orthogonalized
+   matrix — apply the update to a *held-out counterfactual probe* and record the
+   realized return ρ_b(φ) = L_probe(θ) − L_probe(θ − η u_b(φ)). Route to the
+   largest return and **freeze once the ranking settles**, which bounds the
+   search and removes routing variance.
+2. **Allocation (risk side).** After the freeze, each block carries a reference
+   budget β̄_b; the update is θ_b ← θ_b − α β_b d_b(φ_b). Keep the total fixed,
+   Σβ_b = Σβ̄_b =: Bud (a constraint the paper contrasts with scalar
+   "Kelly"/volatility controllers that only move along the simplex diagonal).
+   Risk is the scale-free update-to-weight ratio uwr_b = ‖Δ_b‖/(‖θ_b‖+ε),
+   smoothed as r_b ← γ r_b + (1−γ) uwr_b; allocation at step t reads r(t−1)
+   only. Winsorize against the cross-block median, r̃_b = clip(r_b, m/κ, κm),
+   then solve the capped, budget-neutral system
+   Λ(λ) = Σ_b β̄_b·clip(λ/r̃_b, c⁻¹, c) = Bud by bisection and apply
+   μ_b = clip(λ⋆/r̃_b, c⁻¹, c), β_b = clip(β̄_b μ_b, β_min, β_max).
+
+Defaults: γ = 0.9, κ = 3.0, c = 1.4, ERC clamp [0.5, …]. Reported results:
+FARO-Adaptive reaches 3.2780 nats, matching the hand-designed NorMuonAndAdam
+(3.2794) without a hand-set split; FARO-ERC then improves at 6/6 seeds by
+−0.0136 nats (paired p ≈ 0.031, CI excludes zero), cheaper than the measured
+0.004–0.01 nat noise floor. The gain comes from *trimming high-risk blocks*
+(58.7 % of multipliers < 1, mean 0.98), not from expanding safe ones; a larger
+cap deepens it and saturates, lowering the floor deepens it more than raising
+the ceiling. Under a 60 % corrupted stream it still wins 5/6 seeds. System
+cost is reported as nil (O(B) solve, no parameters/optimizer state).
+
+## Mapping to `tadamw`, and what is exact vs simplified
+
+The fitted mixer has W1 (one H×26 matrix per selector set) and W2 (one vector
+row per selector set, 17 params each). Natural blocks:
+
+| block mode | blocks on the winning shape (`H=16, s1=NONE, s2=BITPOS`) |
+|---|---|
+| `set` (default) | 9: the single W1 matrix + 8 W2 set-rows |
+| `layer` | 2: all W1 params vs all W2 params |
+
+Candidate geometries: **W1: spectral (Muon) vs coordinate (AdamW)**; W2 is
+fixed to coordinate/AdamW (a vector "spectral" arm is not implemented). The
+frozen reference budget β̄_b is that block's LR endpoint (Muon LR for W1,
+vector LR for W2), so ERC moves update mass between W1 and W2 at fixed total.
+
+**Implemented exactly:** Algorithm 1 of the paper — median winsorization,
+capped multiplier, 48-step bisection on Λ(λ), previous-step-only risk, EMA
+γ, clamp [floor, ceil], μ_b multiplying the block's LR. Neutrality was checked
+in debug mode (a diagnostic prints if Σβ̄μ drifts by >1e-4 relative; it never
+fired). Risk Δ uses only the geometry-induced update, excluding decoupled WD.
+
+**Simplified / approximated (this is not a full FARO reproduction):**
+
+* The paper's routing probe is a disjoint held-out shard and evaluates each
+  candidate's update over the training trajectory. Here a deterministic slice
+  of 16 strided samples per batch is used, with shadow copies of the block's
+  weights and of both optimizer states; one step is evaluated per exploration
+  batch. No extra training data is withheld, so the probe is *in-sample*.
+* `TAW_FARO_STAT=probe` (default) computes the actual one-step **counterfactual
+  loss decrease in bits** for both candidates via the fitter's real cost table
+  (`faro_probe_loss`), i.e. Eq. (1) with a 16-sample probe.
+  `TAW_FARO_STAT=lin` is a cheaper first-order variant:
+  ‖g‖₁/√N (coordinate) vs ⟨g, NS(g)⟩/‖NS(g)‖_F (spectral), both per unit
+  update (Appendix G's linearized return). Full multi-step counterfactual
+  evaluations over all blocks would multiply fitting cost many-fold and were
+  not attempted.
+* Routes freeze after un-tie plus `TAW_FARO_EXPLORE` batches (default 20);
+  during exploration the applied W1 geometry alternates by step parity so
+  both candidates mature their momentum state. With `TAW_FARO_ROUTE=muon|adam`
+  exploration is skipped and the route is imposed.
+* B = 9 (or 2), not 117. With `s1=NONE` there is only one W1 set, so
+  per-selector-family routing degenerates, as already observed for
+  `TAW_HYBRID=route` on the base branch.
+
+**Knob-off is byte-identical:** `adam_rows`/`muon_rows` keep their original
+weight-update expressions verbatim; extra parameters are a NULL risk pointer
+and a block id, and all FARO state is allocated/freed only when `TAW_FARO` is
+on. Verified with `cmp` against the base branch's archives.
+
+## Environment knobs (all unset = shipped behaviour)
+
+| variable | default | meaning |
+|---|---|---|
+| `TAW_FARO` | `0` | `1`/`on`/`yes`/`true` enables FARO; `0` is bit-exact base |
+| `TAW_FARO_ROUTE` | `ret` | W1 geometry: `ret` (measured return), `muon`, `adam` |
+| `TAW_FARO_STAT` | `probe` | `probe` (one-step counterfactual bits) or `lin` (linearized) |
+| `TAW_FARO_EXPLORE` | `20` | post-untie batches used to measure returns (freeze point) |
+| `TAW_FARO_ALLOC` | `erc` | `none` disables reallocation (μ ≡ 1) |
+| `TAW_FARO_BLOCKS` | `set` | `set` (one block per W1/W2 set) or `layer` (W1 vs W2) |
+| `TAW_FARO_CAP` | `1.4` | allocation cap c (μ ∈ [1/c, c]) |
+| `TAW_FARO_GAMMA` | `0.9` | risk-EWMA decay γ |
+| `TAW_FARO_KAPPA` | `3.0` | winsor bound κ |
+| `TAW_FARO_FLOOR` / `TAW_FARO_CEIL` | `0.5` / `2.0` | final clamp on μ |
+| `TAW_FARO_DEBUG` | `0` | print freeze decision, returns, multiplier range, risks |
+
+## Sweep (archive bytes, lower is better; all `-p mix`, both corpora)
+
+All rows below use the tuned Muon recipe unless marked. `Δ` is vs the tuned
+Muon control sum 1,095,864 (or vs tuned AdamW 1,104,580 for the last two rows).
+"cells" counts archive cells improved out of four. Every archive was decoded
+and `cmp`-checked (`decode_ok=1` for all 100 new `bench/results.tsv` rows).
+
+| config | text L1 | text L5 | libc L1 | libc L5 | sum | Δ | cells |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| tuned Muon = FARO-Adaptive | 179678 | 177816 | 371373 | 366997 | 1,095,864 | 0 | — |
+| **ERC c=1.8, set blocks (winner)** | **179502** | **177738** | **371208** | **366890** | **1,095,338** | **−526** | **4/4** |
+| ERC c=1.5 | 179473 | 177884 | 371111 | 366890 | 1,095,358 | −506 | 3/4 |
+| ERC c=1.8, κ=1.5 | 179606 | 177756 | 371145 | 366835 | 1,095,342 | −522 | 4/4 |
+| ERC c=1.8, γ=0.5 | 179560 | 177823 | 371244 | 366790 | 1,095,417 | −447 | 3/4 |
+| ERC c=1.6 | 179601 | 177785 | 371150 | 366940 | 1,095,476 | −388 | 4/4 |
+| ERC c=2.2 | 179448 | 177874 | 371151 | 367126 | 1,095,599 | −265 | 2/4 |
+| ERC c=2.6 | 179502 | 177879 | 371151 | 367126 | 1,095,658 | −206 | 2/4 |
+| ERC c=4.0 | 179501 | 177879 | 371151 | 367126 | 1,095,657 | −207 | 2/4 |
+| ERC c=1.8, layer blocks | 179694 | 177919 | 371301 | 366746 | 1,095,660 | −204 | 2/4 |
+| ERC c=2.0 | 179500 | 177844 | 371203 | 367126 | 1,095,673 | −191 | 2/4 |
+| ERC c=1.4 (paper default) | 179542 | 177774 | 371285 | 367159 | 1,095,760 | −104 | 3/4 |
+| routing `ret` (probe), alloc=none | 179993 | 177983 | 372260 | 368099 | 1,098,335 | +2471 | 0/4 |
+| routing `ret` (probe) + ERC c=1.8 | 179924 | 177873 | 372119 | 367809 | 1,097,725 | +1861 | 0/4 |
+| routing `ret`, `STAT=lin` + ERC c=1.8 | 179924 | 177926 | 372119 | 367809 | 1,097,778 | +1914 | 0/4 |
+| tuned AdamW + ERC c=1.8 (W2 only¹) | 179898 | 178678 | 373875 | 371261 | 1,103,712 | −868² | 4/4 |
+| tuned AdamW + ERC c=1.8 (both) | 179965 | 178589 | 374023 | 371460 | 1,104,037 | −543² | 4/4 |
+
+¹ `TAW_HYBRID=adam` routes W1 through the shipped AdamW path; an early version
+of the hook scaled only W2 there. Both variants are shown for transparency;
+the final code scales both (last row).
+² Δ against tuned AdamW (1,104,580).
+
+Other observations:
+
+* **Cap response.** The gain appears at 1.4, peaks around 1.5–1.8 and then
+  partly reverses for 2.0–4.0, unlike the paper's monotone-then-flat curve;
+  with only 9 blocks and a 608-byte model the discrete quantized weights make
+  larger tilts lose their benefit. The paper's default 1.4 is not optimal here.
+* **floor/κ are inert at c=1.8.** `TAW_FARO_FLOOR=0.25` and `TAW_FARO_KAPPA=10`
+  reproduced the winner byte-for-byte (the downward clamp cannot bind at
+  c=1.8, and κ=3 already covers the observed risk spread). Tightening κ to 1.5
+  kept 4/4 wins. γ=0.5 (faster risk response) was slightly worse.
+* **Freeze point / granularity.** With routes forced, `TAW_FARO_EXPLORE` ∈ {5,
+  20, 40} is byte-identical (there is nothing to measure). Per-set blocks beat
+  the 2-block `layer` partition: risk is more informative cross-sectionally
+  with 9 blocks, consistent with the paper's 117-block premise.
+* **Allocation is not a global LR change.** FARO-Adaptive (ERC off) is exactly
+  the tuned Muon control; the whole gain is the cross-block reallocation at
+  fixed total. ERC also transfers to tuned AdamW (4/4 cells), so the effect is
+  not specific to the Muon geometry.
+
+## Routing lane: a negative result
+
+With `route=ret`, both statistics chose **coordinate/AdamW for W1**:
+the one-step probe returned 0.477 bits (coordinate) vs 0.336 (spectral) on
+the sampled batches; the linearized statistic also preferred coordinate.
+Consequently W1 loses orthogonalization and the archives get ~2.5 KB worse
+than the tuned recipe, with ERC recovering only ~0.6 KB of that. This is the
+opposite of the paper's "recovers the human prior" result. Likely reasons:
+(a) the probe is in-sample and one-step, so it rewards the geometry with the
+best immediate first-order alignment, whereas Muon's advantage is in
+long-horizon conditioning over 800–1270 steps; (b) the probe is 16 samples
+from the current batch rather than a disjoint held-out shard; (c) this model
+has one W1 matrix, so there is no cross-block routing structure to exploit.
+A faithful reproduction would need a held-out probe and multi-step/full-horizon
+returns; that was deliberately not attempted because it would multiply fitting
+cost many times over. **The routing approximation is therefore not validated
+here, and FARO-Adaptive is implemented as a forced-route reference arm.**
+
+## Verification
+
+* `ctest --test-dir build --output-on-failure`: **12/12** with no overrides and
+  **12/12** with the winning FARO environment.
+* Knob-off control archives `cmp`-identical to `exp-muon-adam`'s
+  `muon_055_lowfin_*` and to the shipped controls 181557/179166/379197/375291.
+* All 100 new benchmark rows have `decode_ok=1`; the format/decoder were never
+  modified, so byte-identical decode is expected and observed.
+* Neutrality check (debug mode): no budget drift reported in any run.
+
+## Reproduce the winner
+
+```sh
+cd /home/andrew/.local/share/opencode/worktree/8500c0/exp-faro
+cmake --build build -j1
+NAME=faro_repro \
+TAW_HYBRID=muon TAW_MUON_LR0=0.055 TAW_MUON_LR1=0.0011 \
+TAW_VEC_LR0=0.003 TAW_VEC_LR1=0.00015 \
+TAW_FARO=1 TAW_FARO_ROUTE=muon TAW_FARO_CAP=1.8 \
+  ./bench.sh
+# expect 179502 / 177738 / 371208 / 366890, sum 1,095,338
+```
+
+## Rebase verification (new main `1aa3dd7`, PR #3 MALTER + PR #4 Muon)
+
+After rebasing onto upstream main, a pristine build of `1aa3dd7` (from
+`git archive`) and the rebased FARO build were compared on 12 identical
+encodes with `cmp`:
+
+| env | archives | result |
+|---|---|---|
+| no overrides (shipped) | 4 | byte-identical to new main (181557/179166/379197/375291) |
+| tuned Muon (`TAW_HYBRID=muon`, tuned LRs) | 4 | byte-identical to new main (179678/177816/371373/366997) |
+| MALTER winner (`TAW_MALT=malter`, tuned LRs) | 4 | byte-identical to new main (179405/177138/370898/366504) |
+
+So upstream's Muon and MALTER implementations are fully preserved, with no
+duplicate Muon code: the only `fit.c` delta vs `origin/main` is the optional
+FARO state/routing/ERC logic plus optional risk hooks on the three W1 update
+routines (NULL/no-op when `TAW_FARO` is off). ctest: **12/12** with no
+overrides and **12/12** with the winning FARO env. The FARO winner reproduced
+exactly after the rebase: **179502 / 177738 / 371208 / 366890**
+(sum 1,095,338, −526 B vs tuned Muon), all four decodes verified byte-exact.
+
+## Caveats
+
+* Archive bytes are deterministic for a fixed build, so "4/4 cells" is four
+  corpus/level cells of one deterministic fitter, **not** a 6-seed statistical
+  test like the paper's. The margin (0.05 %) is small in absolute terms.
+* Only levels 1 and 5, `-p mix`, two 1 MiB corpora, and the current winning
+  shape were benchmarked; transfers to other shapes/L9 are untested.
+* The 9-block partition puts the entire Muon matrix in one block, so ERC's
+  "risk parity" here mostly means trading W1 LR against eight W2 LR rows.
+* Routing uses in-sample, one-step counterfactuals and only W1 has a second
+  geometry candidate; see the negative result above.
+* Timing was not used as a metric (shared 12-core box); the implementation adds
+  O(B) arithmetic per step (B ≤ 9 here) and a few hundred bytes of state, but
+  the probe path adds ~16 forward evaluations per W1 block per exploration
+  batch and is **not** free when `route=ret` is used.
