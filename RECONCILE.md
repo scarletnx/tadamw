@@ -1,372 +1,184 @@
-# RECONCILE.md — Foundation vs. the staged PR fixes
+# RECONCILE.md — fitgolden reconciliation for the staged merges
 
-**Same persona, same verdict style:** this is a merge-order design review, not
-a rematch. I read every file side by side; nothing below is inferred from a
-PR title.
+Scope: local worktrees only, read-only. Snapshots checked: foundation
+`foundation/golden-harness` @ `d08f019`; #7 `0fe5ff5`, #8 `af5fd00`,
+#10 `0ed49b2`, #11 `eff6ac4`, #13 `12de443`, #15 `2c075a1`, #5 `09311ce`,
+#6 `e40b8c0`, #19 `16d91c4`. Nothing fetched, no corpora touched, no push.
 
-**Refs read (all local worktrees, read-only):**
+If a decoder from main reads this archive, then the archive must still be
+main's — and if a *test* is supposed to prove that, there must be exactly one
+copy of the test. Today there are eight.
 
-| What | Ref | Worktree |
+## 1. Inventory of the collision
+
+| Worktree | `tests/fitgolden.h` | `tests/test_fitgolden.c` | `taw_test()` added | extra arm targets / CLI tests |
+|---|---|---|---|---|
+| foundation `d08f019` | **yes** (`TAW_TESTS_FITGOLDEN_H`) | **yes** (4-row baseline, own `main`) | `fitgolden` | — |
+| #7 lr-baseline | yes (same guard) | yes (4-row baseline + tuned) | `fitgolden` | none — tuned table is in the same file |
+| #8 eps-gate | yes (same guard, `static inline` helper, `TAW_GOLDEN_PRINT`) | **no** | `c3_fit` | `cli_fit_c3` |
+| #10 calibration | yes (same guard, `fit_check(..., bool cal)`) | yes (4-row baseline) | `fitgolden`, `cal_fit` | — |
+| #11 entropygate | **no** (helper + `fgold` + tables inlined in the `.c`) | yes (inline helper, base + gate tables) | `fitgolden` | `cli_fit_mix_seek`, `cli_fit_gate_seek` (foreach) |
+| #13 hnet-feature | yes (same guard, `fgold` has `pred` field) | yes (4-row baseline with `pred`) | `hnet`, `fitgolden`, `hnet_fit` | `cli_fit_hnet_seek` |
+| #15 hnet-blocks | **no** (own `dfgold` + own `static fit_check`) | **no** | `dynfit` | — |
+| #5 faro | yes (**different guard** `TAW_TEST_FITGOLDEN_H`) | yes (4-row baseline) | `fitgolden`, `faro_fit` | `cli_fit_faro_seek` |
+| #6 namo | yes (same guard, embeds `base_golden[]` in header) | yes (uses header's table) | `fitgolden`, `namo` | — |
+| #19 ema | yes (same guard, adds `fit_probe`/`fit_roundtrip`, embeds 6-row `fitgolden_base[]`) | yes (uses header's table) | `fitgolden`, `ema` | — |
+
+Counts that matter:
+
+- **`tests/fitgolden.h`: 8 copies** (foundation, #7, #8, #10, #13, #5, #6, #19).
+- **`tests/test_fitgolden.c`: 8 copies** (foundation, #7, #10, #11, #13, #5, #6, #19).
+- **`taw_test(fitgolden)`: 8 copies** of `add_executable(test_fitgolden ...)` and
+  `add_test(NAME fitgolden ...)`. The second one is a hard CMake error
+  ("cannot create target … another target with the same name already exists"),
+  not a soft duplicate-test warning.
+- All 4 baseline tables are the same council/e values; #19 adds two L3 rows,
+  #11/#13 add a `pred` field, #6/#19 put the table in the header, #8 changes
+  `fit_check` to `static inline` and adds a `TAW_GOLDEN_PRINT` early-out that
+  **skips all assertions** when set.
+- Different `fgold` layouts: foundation `uint64_t model_size`; most PRs
+  `size_t model_size`; #11/#13 insert `taw_predictor pred` as the **third**
+  field. Copying a 6-field initializer into the 5-field survivor silently
+  shifts every value — this is the highest-risk mechanical error.
+- Different include guards: faro's `TAW_TEST_FITGOLDEN_H` vs the other seven
+  `TAW_TESTS_FITGOLDEN_H`. A TU including both gets duplicate `fgold` and
+  duplicate `fit_check` definitions.
+
+**CTest target-name audit (all 10 worktrees):** the *only* duplicated
+`taw_test()` name is `fitgolden` (8×). `c3_fit`, `cal_fit`, `hnet`, `hnet_fit`,
+`dynfit`, `faro_fit`, `namo`, `ema` are each unique. CLI test names are unique
+too: `cli_fit_c3`, `cli_fit_mix_seek`, `cli_fit_gate_seek`, `cli_fit_hnet_seek`,
+`cli_fit_faro_seek`. The `add_test(NAME ${name})` inside `taw_test()` is a
+function template, not a second collision. No existing 12 test names are
+reused by any PR.
+
+## 2. Ruling — exactly one survivor
+
+**Survivor helper: `tests/fitgolden.h` from `d08f019`** (foundation). Delete the
+other seven copies. Required minimal extensions, in this order:
+
+1. Keep the guard `TAW_TESTS_FITGOLDEN_H` (reject faro's variant) and keep
+   `fgold` **bit-for-bit as it is**: `{int level; taw_weights w; size_t arc_n;
+   uint64_t model_size; uint32_t model_crc;}`. Field order must never change;
+   every existing 5-field initializer is positional.
+2. Add an options struct and an extended entry point; do **not** add `pred` to
+   `fgold`:
+   ```c
+   typedef struct { taw_predictor pred; uint8_t profile; } fgold_opts;
+   static void fit_check_ex(const char *arm, const fgold *g, size_t ng,
+                            const fgold_opts *o);
+   static void fit_check(const char *arm, const fgold *g, size_t ng)
+   {   /* wrapper: .pred = TAW_PREDICTOR_MIX, .profile = 0 (don't check) */ }
+   ```
+   #10's `bool cal` becomes `.profile = 6`; #11's gate becomes
+   `.pred = TAW_PREDICTOR_GATE, .profile = 11`; #13's hnet becomes
+   `.pred = TAW_PREDICTOR_HNET, .profile = 14`. The 6-field tables in #11/#13
+   are rewritten to 5 fields plus an opts argument — never copied verbatim.
+3. Adopt #19's `fit_source()`, `fit_probe()`, `fit_roundtrip()` so the MALTER
+   A/B and any future "measure, don't assert" arm never reimplements the fit.
+   `fit_check_ex()` is then a thin loop over `fit_probe()` + comparison +
+   `fit_roundtrip()`.
+4. Adopt the *idea* of #8's `TAW_GOLDEN_PRINT`, but as a separate
+   `fit_check_print()` that only prints. **Reject** #8's current behaviour
+   where setting the env var makes `fit_check` skip every assertion — a CI
+   machine with that variable set would report a false green.
+5. Put the one canonical baseline table in the header as `static const fgold
+   fitgolden_base[]` + `FITGOLDEN_BASE_N` (the #6/#19 pattern, generalized).
+   `static const` gives internal linkage, so arm translation units may include
+   it without duplicate symbols. **No other file may define a baseline table.**
+   Extend it from 4 to 6 rows with #19's L3 cells; I re-measured both on main
+   during this reconciliation and they match exactly: `L3/F16 arc=261701
+   model=568 crc=0x1388A8EA`, `L3/Q8 arc=263030 model=1888 crc=0x1A6E3799`.
+6. Add a single `fgold_env_scrub()` helper that unsets **every** `TAW_*`
+   variable via `environ` (with `_POSIX_C_SOURCE 200809L` at the top of the
+   header, which every test includes first). This replaces the incomplete
+   hand-written knob lists in #6/#7/#8/#10/#19 — e.g. #7's "shipped" arm does
+   not unset `TAW_FIT_AVG`, so #19's default-on build would silently invalidate
+   it. Each arm calls `fgold_env_scrub()` first, then sets only its own knobs.
+7. Reject #15's local `static fit_check` name: rename to `dyn_fit_check()`.
+   Its `dfgold` struct (index CRC, block count, first/last raw_len) stays
+   local to `test_dynfit.c` — it is a container golden, not a fitter golden.
+
+**Survivor test: `tests/test_fitgolden.c` from `d08f019`.** Delete the other
+seven copies. It shrinks to a single `main()` that calls
+`fit_check("base", fitgolden_base, FITGOLDEN_BASE_N)` and returns
+`CHECK_DONE()`. It owns the sole `taw_test(fitgolden)` registration.
+
+## 3. Where the per-PR arm tables go
+
+One CTest target per PR (or per distinct mechanism), all with unique names.
+Every arm file includes `fitgolden.h`, calls `fgold_env_scrub()`, and contains
+**only** its own tables — no baseline table, no helper copy, no `pred` field
+in `fgold`, no duplicate `main`.
+
+| PR | Arm tables to move | Surviving file / target |
 |---|---|---|
-| Foundation (mine) | `foundation/ns-refactor` @ `e682872` | `struct-a` |
-| Design memo | `struct/a` @ `10d3fd4` | `struct-a` |
-| #6 NAMO | `e40b8c0` | `exp-namo` |
-| #5 FARO | `09311ce` | `exp-faro` |
-| #8 C3 gate | `af5fd00` | `exp-eps-gate` |
-| #19 EMA | `16d91c4` | `exp-ema` |
-
----
-
-## 0. Verdict in one paragraph
-
-**Foundation's `src/fit_opt.h` wins.** NAMO's own `src/fit_opt.h` is a strict
-subset: its `ns_ortho()` body is *byte-identical* to mine (verified by text
-comparison, not eyeballing), and its only extra symbols are the shrink gate,
-which belongs to #8's single-gate owner anyway. Every PR still carries its own
-`fsqrt`, `MUON_MAXDIM/MUON_MAXEL`, `hyb_mode`, `optcfg` and local
-`adam_rows/muon_rows/malt_rows` in `fit.c` — those are hard compile/link
-collisions with the foundation and are the bulk of the deletion checklists.
-The gate concept should be **one** `fit_gate_step()` (#8) reached through
-**one** `step_shape` slot in foundation's `opt_hooks`; NAMO's `shrink_*` and
-#8's `eps_cfg` gate fields are configuration aliases into it. FARO's risk bank
-and EMA's averaging attach to the same `opt_hooks`, not to optimizer branches.
-NAMO's published numbers do **not** need a new re-baseline: `e40b8c0` already
-re-baselined them after its shared-NS/shared-gate change (§3).
-
----
-
-## 1. Exact collisions (file / symbol, with line numbers)
-
-### 1.1 Physical file collisions
-
-| File | Foundation | NAMO `e40b8c0` | Others | Resolution |
-|---|---|---|---|---|
-| `src/fit_opt.h` | 173 lines: guard `TAW_FIT_OPT_H`, `fsqrt`, NS helpers, `hyb_mode`, `optcfg`, `opt_plan`, `opt_hooks`, 4 wrapper decls | **new file**, 74 lines: **same guard**, `NS_MAXDIM/EL`, `ns_ortho`, `shrink_cfg`, `shrink_begin`, `shrink_at` | absent in #5/#8/#19 | **Delete NAMO's copy.** Foundation's is a superset; same guard means a naive file merge silently drops one side. |
-| `src/fit_opt.c` | new, defines `adam_rows`, `muon_rows`, `malt_rows`, `ns_score` | absent (header-only) | absent | Keep foundation's; add `namo_rows` here on #6 rebase. |
-| `tests/fitgolden.h` | absent | new, 73 lines with `base_golden[]` | **also new in #5, #8, #19** — all four copies carry the *same* `base_golden` values (`0x197291E6u`, `0x47F69FFBu`, `0xC9DED846u`, `0xB0F10114u`) | One copy wins at integration; the tables agree, so no numeric risk. Foundation's `cli_fit_golden.cmake` is a separate, complementary check. |
-
-### 1.2 Symbol collisions inside `fit.c`
-
-Every PR was branched from `1aa3dd7`, so all of them still own the original
-definitions. Line numbers are from the staged refs:
-
-| Symbol | Foundation | NAMO | FARO | #8 | #19 | Collision kind |
-|---|---|---|---|---|---|---|
-| `fsqrt()` | `static inline` in `fit_opt.h:29` | `static` `fit.c:28` | `fit.c:27` | `fit.c:28` | `fit.c:108` | **Redefinition** in every PR once `#include "fit_opt.h"` is present. Delete all four locals. |
-| `NS_MAXDIM/NS_MAXEL` | `enum` in `fit_opt.h:46` (+`MUON_*` aliases at :48) | `#define` in its `fit_opt.h:13-14` | `enum MUON_MAX*` `fit.c:435` | `fit.c:436` | `fit.c:529` | Macro-vs-enum clash if both headers merge; duplicate enum constants if PR locals stay. Use foundation's enums + aliases. |
-| `ns_ortho()` | `fit_opt.h:70` | NAMO `fit_opt.h:16` — **body byte-identical (verified)** | deleted with `faro_ns_score` | still inline in `fit.c:636,741` (2 copies) | still inline in `fit.c:600,674` (2 copies) | Duplicate definition only in NAMO's file; elsewhere it is *duplication to delete*, not a name clash. |
-| `hyb_mode` | `fit_opt.h:102` (7 values) | `fit.c:456` (**+HYB_NAMO, HYB_NAMOD**) | `fit.c:437` | `fit.c:438` | `fit.c:531` | Duplicate typedef. Foundation's must gain the two NAMO values; PR locals deleted. |
-| `optcfg` | `fit_opt.h:117` | `fit.c:467` (+`n1t,n2t,nb2,nscale,nclamp,shrink,drow`) | `fit.c:452` | `fit.c:453` | `fit.c:546` | Duplicate typedef; foundation's must gain NAMO fields + one gate-config field. |
-| `adam_rows()` | `fit_opt.c:16`, `(…, mix, const opt_hooks *h, unsigned bid)` | `fit.c:508` (old 10-arg) | `fit.c:491` (**11-arg `float *risk, unsigned bid`**) | `fit.c:604` + `adam_rows_gated` at :564 | `fit.c:582` | **Duplicate external symbol** at link time; FARO's `(risk,bid)` maps 1:1 onto foundation's `(h,bid)`. |
-| `muon_rows()` | `fit_opt.c:33` | `fit.c:523` | `fit.c:511` | `fit.c:613` | `fit.c:597` | Same. |
-| `malt_rows()` | `fit_opt.c:79` | `fit.c:653` | `fit.c:589` | `fit.c:686` | `fit.c:670` | Same. |
-| `namo_rows()` | **absent** (reserved `W1_NAMO/NAMOD` in `opt_plan`, `fit_opt.h:136`) | `fit.c:564` (static, already calls `ns_ortho`) | absent | absent | absent | Not a collision — the one wrapper that must be *added* to foundation. |
-| Gate math | none | `shrink_cfg/shrink_begin/shrink_at` in its `fit_opt.h:49-72` | none | `fit_gate_step()` `fit.c:544`, declared in `src/fit_gate.h` (`TAW_FIT_GATE_H`) | none | **Two gate owners** with identical math (§4). |
-| `ns_score()` | `fit_opt.c:180` | absent | **deleted** at `09311ce` (routing lane removed; comment `fit.c:724-726` says shared refactor is upstream's) | absent | absent | Dead code in foundation after #5's staged fix — delete or keep only as an explicit test helper (§6.4). |
-| Hook plumbing | `opt_hooks { void *ctx; }` `fit_opt.h:149` | none | `risk` threaded as raw params | `eps_cfg` + `sig` threaded through `adam_rows_gated` | `avg_mode` through `tnet_init/tnet_train` signatures | All four must attach to the one `opt_hooks` (§5). |
-
-### 1.3 Confirmed non-collision
-
-The NS polynomial bodies in foundation `fit_opt.h:70-98` and NAMO
-`fit_opt.h:16-44` are **byte-for-byte identical** (coefficients, `float s`
-accumulators, `i/j/k` nesting, `mr*mc` final loop). NAMO already replaced the
-inline loops in its `muon_rows` (branch diff `@@ -523`) and `malt_rows`
-(`@@ -628`) with `ns_ortho()`; there is no numeric difference to arbitrate.
-
----
-
-## 2. Which `fit_opt.h` wins, and why
-
-1. **Superset.** Foundation has the ABI (`hyb_mode`, `optcfg`, `opt_plan`,
-   `opt_hooks`), the `fsqrt` single source, the transpose helpers, four
-   wrapper declarations and a compiled `fit_opt.c`. NAMO's file has one
-   algorithm and a gate subset. Choosing NAMO's file would delete the hook
-   ABI that #5/#8/#19 need.
-2. **Numerics are preserved.** The shared NS body is identical (§1.3), so
-   adopting foundation's header cannot move an orthogonalization result by a
-   single bit.
-3. **Build integration.** Foundation registers `fit_opt.c` in
-   `src/CMakeLists.txt` and has `tests/test_fit_opt.c` pinning both transpose
-   cases and `H=32`. NAMO's header-only variant has no equivalent test.
-4. **The gate is not a header concern once owned.** NAMO's `shrink_*` helpers
-   are configuration + two-pass state; they belong behind `step_shape` (§4),
-   not in the single-algorithm header.
-
-**Action:** delete `src/fit_opt.h` from NAMO's diff entirely; keep its
-`#include "fit_opt.h"` in `fit.c` (branch line 19), which then resolves to the
-foundation file.
-
----
-
-## 3. Merging NAMO's `namo_rows` without moving its published numbers
-
-### 3.1 The NS part is already merged
-
-NAMO's staged `namo_rows` (`fit.c:564`) already calls `ns_ortho()`. Its
-normalization is `x[i] *= 1.0f / norm` after `fsqrt(ss)` and the `1e-12f`
-guard — identical to foundation's `muon_rows`/`malt_rows`. Moving the body
-verbatim into foundation `fit_opt.c` therefore changes **nothing**.
-
-### 3.2 The gate order is already the unified order
-
-The old concern in `STRUCTURE.md` §5 R4 was that NAMO multiplied
-`(mix*lr*upd)*g` while #8 did `mix*lr*(upd*g)`. That is **obsolete for the
-staged refs**:
-
-* NAMO `fit.c:617-622`: `float upd = x[at] + wd*w[i]; if (sig) upd *=
-  shrink_at(...); w[i] -= step * (diag ? d[...] : alpha) * upd;` — gate
-  applied to `upd` *before* the outer scale.
-* #8 `fit.c:590-597`: `float upd = ratio + wd*w[k]; upd *= fac;
-  w[k] -= mix*lr*upd;` — same order, and the comment at :594-596 says moving
-  the gate after `lr` shifts bpc by ~0.02%, so it is deliberate.
-
-Both gate implementations also compute the same state:
-`s = beta*s + (1-beta)*sign(g*scale)`, `g = |s|^p` with `p==2 → a*a`. NAMO's
-`shrink_begin` and #8's `fit_gate_step` (`fit.c:544-550`) are line-for-line
-the same rule.
-
-### 3.3 The numbers are already re-baselined
-
-`tests/test_namo.c:26` says: *"Re-baselined after the X3 shared-NS /
-shared-gate refactor."* Its published CRCs are:
-
-| arm | L1/F16 | L1/Q8 | L5/F16 | L5/Q8 |
-|---|---|---|---|---|
-| `namo` | `0xBDD1E363` | `0x8479754C` | `0x8D502120` | `0xB6AD329D` |
-| `namod` | `0x7E870997` | `0x4C6F6736` | `0xA331EA04` | `0x5744DC67` |
-| `namo+c3` | `0xE08B6854` | `0xB4BA0916` | `0xCFD4F585` | `0xFFC26241` |
-
-**Therefore: no second re-baseline.** Keep these tables verbatim in the
-rebase; if the rebased build changes any of them, the merge is wrong (a hook
-was left on, a gate applied twice, or `fsqrt` got duplicated), not "a new
-measurement".
-
-### 3.4 Concrete port of `namo_rows`
-
-Move the body from `exp-namo/src/fit.c:564-634` to `fit_opt.c` unchanged
-except for the interface:
-
-```c
-void namo_rows(const optcfg *o, float *w, float *m, const float *g,
-    float *vs, float *vc, size_t set, size_t rows, size_t cols, float scale,
-    float lr, float wd, bool diag, const opt_hooks *h, unsigned bid);
-```
-
-* drop the `float *sig` parameter — the gate comes from `h->shape`;
-* replace `shrink_begin(sig, g, rows*cols, scale, &o->shrink)` with
-  `h->shape.begin(h->shape.ctx, g, rows*cols, scale)` (no-op when the hook is
-  absent);
-* replace `upd *= shrink_at(sig, i, &o->shrink)` with
-  `upd *= h->shape.gate(h->shape.ctx, i, g[i]*scale)`;
-* keep `step = lr * o->nscale` and the `w -= step * (diag ? d[...] : alpha) *
-  upd` expression exactly as staged;
-* add the declaration to `fit_opt.h` next to the other wrappers.
-
----
-
-## 4. One gate owner: #8's `fit_gate_step` behind foundation's `step_shape`
-
-There are currently two implementations of the same rule:
-
-* NAMO `fit_opt.h:49-72` — `shrink_cfg` + `shrink_begin` + `shrink_at`;
-* #8 `fit_gate.h` + `fit.c:544-550` — `float fit_gate_step(float *sig, float
-  gk, float beta, float p)`, already exposed to `tests/test_c3_fit.c`
-  (`gate_direct()` checks 0.1 / 0.19 / 0.01).
-
-**#8 wins the math** (it is the exported symbol with direct unit tests). The
-foundation owns the *plumbing*:
-
-```c
-typedef struct {
-	void  *ctx;
-	void  (*begin)(void *ctx, const float *g, size_t len, float scale);
-	float (*gate) (void *ctx, size_t k, float gk);
-	float (*eps)  (void *ctx, size_t k, float vh, float dflt); /* NULL: C2 dropped */
-} step_shape;
-```
-
-* `begin` advances the sign EMA **once per weight** by calling
-  `fit_gate_step(sig+k, g[k]*scale, beta, p)`, stores the multiplier in a
-  per-set bank, and — for `mean_pres` — divides by the row mean with the
-  `gmean < 1e-12f → 1` guard (#8 `fit.c:586-588`). This two-pass shape is
-  required by #8's mean-preserving mode and is also exactly NAMO's
-  `shrink_begin`/`shrink_at` shape.
-* `gate` returns the stored multiplier. `gk` is kept in the signature so a
-  shrink-only implementation can stay stateless if desired.
-* Wrappers (`adam_rows`, `muon_rows`, `malt_rows`, `namo_rows`) call
-  `h->shape.begin/gate` only. They never contain a sign EMA.
-* `optcfg` gains one config block used by both PRs:
-
-```c
-struct { bool on; float beta, p; bool mean_pres; } gate;
-```
-
-  with `#8` setting `beta=TAW_EPS_SIGN_BETA` (0.9), `p=TAW_EPS_GATE_P` (1.0),
-  `mean_pres = (TAW_GATE_MODE != "shrink")`; and NAMO setting
-  `beta=TAW_NAMO_GATE_BETA` (0.9), `p=TAW_NAMO_GATE_P` (1.0),
-  `mean_pres=false`, `on = is_namo && TAW_NAMO_GATE=="c3"` (NAMO's P6-1 leak
-  guard at `fit.c:795-802` must be preserved).
-* #8 keeps `eps_cfg` only for the *dispatch* concerns (`layers`, `scope`,
-  `debug`) and drops its C2/C3/nc9 mode enum and gate fields; `muon_rows` and
-  `malt_rows` in #8 remain untouched by the gate (its own comment at
-  `fit.c:494-495`).
-* Delete NAMO's `shrink_cfg`, `shrink_begin`, `shrink_at` with its header.
-  `t->sig` (NAMO `fit_internal.h` diff, `[n1]`) becomes the shared gate's
-  sign bank; allocate `[n1+n2]` as #8 does and mirror both layers at untie.
-  NAMO only reads W1 entries, so the extra W2 mirror cannot change its
-  numbers — verify with the §3.3 CRCs.
-
----
-
-## 5. How #8 / #6 / #5 / #19 attach to `opt_hooks`
-
-Foundation currently has only `void *ctx`. Extend it — once — to:
-
-```c
-typedef struct {
-	void      *ctx;       /* keep: feature-private state */
-	step_shape shape;     /* §4: the single C3 / NAMO_GATE gate */
-	float     *risk;      /* FARO bank [nb]; NULL = no accounting */
-	unsigned   nb;        /* bank length (debug/bounds) */
-	void (*pre_step )(void *, tnet *, optcfg *, uint64_t step, bool tied);
-	void (*pre_set  )(void *, tnet *, unsigned layer, unsigned set,
-	                  opt_plan *);
-	void (*post_set )(void *, tnet *, unsigned layer, unsigned set,
-	                  size_t off, size_t len, uint64_t step);
-	void (*post_step)(void *, tnet *, uint64_t step);
-	void (*finalize) (void *, tnet *);
-} opt_hooks;
-```
-
-**#8 (gate):** fill only `shape` + `ctx` (the `eps_cfg` layers/scope logic
-decides *which* set gets a non-NULL shape, in the dispatch, not in the
-wrapper). Ungated sets see `shape.begin == NULL` and get the verbatim main
-expression.
-
-**#6 (NAMO):** fill `shape` from `optcfg.gate` for W1, plus the NAMO branch in
-`plan_w1`. No new hook slot.
-
-**#5 (FARO):** set `h.risk = fr.usum` when `fr.frozen && fr.alloc`; use
-`pre_step` for `faro_allocate`, `pre_set` for `fb`/`mu[fb]` LR scaling and
-forced geometry, `post_step` for `faro_measure`. The staged FARO passes
-`risk, bid` positionally (`fit.c:1129-1169`); those become `h->risk` and the
-already-present `bid` argument — a mechanical rename, **no** new signature
-change. Keep the exact expression `float upd = mix*lr*(mh/(fsqrt(vh)+eps));
-risk[bid] += upd*upd;` (wd excluded, `fit.c:502-505`) — a generic
-`w_after - w_before` hook would change rounding and is not acceptable.
-
-**#19 (EMA):** one `post_set` (fold the touched `off/len` using
-`ema_pow(decay, step - last[set])`) and one `finalize` (`wa → w`, SWA mean).
-Drop `avg_mode` from `tnet_init`/`tnet_train`; wire it in `fit_one()`.
-GPU nets get `h = NULL` (staged EMA already keeps last iterate for GPU).
-
-**GPU boundary:** `fit_gpu.c/.comp` stay untouched; no hook is ever passed
-there.
-
----
-
-## 6. What each staged PR must delete to rebase onto `foundation/ns-refactor`
-
-### 6.1 NAMO (`e40b8c0`) — the full checklist
-
-**Delete:**
-1. `src/fit_opt.h` (whole file) — foundation's wins (§2).
-2. `fit.c:28-40` local `static float fsqrt`.
-3. `fit.c:450` `enum { MUON_MAXDIM = 32, MUON_MAXEL = ... }`.
-4. `fit.c:456-462` `typedef enum { ... HYB_NAMO, HYB_NAMOD } hyb_mode` —
-   instead add those two values to `fit_opt.h:102`.
-5. `fit.c:467-478` `typedef struct optcfg` — instead add `n1t, n2t, nb2,
-   nscale, nclamp, drow` and the shared `gate` config (§4) to
-   `fit_opt.h:117`.
-6. `fit.c:508` `adam_rows`, `:523` `muon_rows`, `:653` `malt_rows` (all three
-   are now in `fit_opt.c`; leaving them is a duplicate-symbol link error).
-   Their NS loops are already gone at this ref — do not reintroduce them.
-7. `shrink_cfg` / `shrink_begin` / `shrink_at` (deleted with the header) and
-   the `o.shrink` initializer at `fit.c:795-802` → replaced by `o.gate` plus
-   `h->shape` wiring.
-
-**Add / keep:**
-8. Move `namo_rows` (`fit.c:564-634`) to `fit_opt.c` with the §3.4 signature;
-   add its declaration to `fit_opt.h`.
-9. Keep `t->v2s/v2c/sig` state, the untie mirror (`fit.c:427-436`), all
-   `TAW_NAMO_*` env parsing, the `is_namo` warm-up guard, `n1t/n2t` updates
-   and the dispatch branch (`fit.c:951-958`).
-10. Keep `tests/test_namo.c` and its CRCs unchanged (§3.3); resolve the
-    duplicated `tests/fitgolden.h` with the other PRs.
-11. `src/CMakeLists.txt`: no new change — foundation already compiles
-    `fit_opt.c`.
-
-### 6.2 FARO (`09311ce`)
-
-Delete its local `fsqrt` (`:27`), `MUON_MAX*` enum (`:435`), `hyb_mode`
-(`:437-445`), `optcfg` (`:452-463`), and all three local wrappers
-(`:491/:511/:589`, including their two inline NS loops at `:548/:657`).
-Keep `faro_ctx` and the ERC math (`:718+`) verbatim; replace the positional
-`risk` argument with `h->risk` (§5). `faro_ns_score` is already gone — do not
-resurrect it. The feature CRCs in `tests/test_faro_fit.c` (e.g.
-`erc_muon` L5/Q8 `0x54A5EB53`) must stay unchanged.
-
-### 6.3 #8 C3 (`af5fd00`)
-
-Delete its local `fsqrt` (`:28`), `MUON_MAX*` (`:436`), `hyb_mode`
-(`:438-446`), `optcfg` (`:453-464`), `adam_rows_gated` (`:564`) and the thin
-`adam_rows` (`:604`) — foundation's `adam_rows` plus `step_shape` replaces
-both. Delete `muon_rows` (`:613`) and `malt_rows` (`:686`) entirely (two NS
-copies) along with their `MUON_MAXDIM` scratch. **Keep** `src/fit_gate.h` and
-`fit_gate_step` (`:544-550`) as the single gate math, keep `eps_cfg` as
-layers/scope/debug config, and keep its feature CRCs (e.g. `SHRINK` L5/Q8
-`0x84D8C2B4`). Preserve the gate-before-`lr` rounding order at `:594-597`.
-
-### 6.4 #19 EMA (`16d91c4`)
-
-Delete its local `fsqrt` (`:108`), `MUON_MAX*` (`:529`), `hyb_mode`
-(`:531-539`), `optcfg` (`:546-557`) and all three local wrappers
-(`:582/:597/:670`, two more NS loops). Keep `wa/last1/last2` in `tnet` and
-`ema_pow`, convert the two inline fold blocks to `post_set`, and drop
-`avg_mode` from both signatures.
-
-### 6.5 Foundation clean-up found during reconciliation
-
-`ns_score()` in `fit_opt.c:180` was written for FARO's `TAW_FARO_STAT=lin`
-score, but staged #5 **removed the routing lane** (`fit.c:720-726`). It now has
-no caller. Either delete it from `fit_opt.h`/`fit_opt.c` or keep it with a
-comment that it is a test-only helper for `tests/test_fit_opt.c`; do not leave
-an unexplained dead export. Nothing else in the foundation is invalidated.
-
----
-
-## 7. Verification at each step
-
-1. **Bit-identity of the shared primitive** — `tests/test_fit_opt.c` already
-   compares `ns_ortho` and all wrappers against verbatim main loops, raw
-   float bytes, both transpose cases, `H=32`, `ns=1/5`. Re-run after every
-   rebase (`ctest -R fit_opt`).
-2. **Common baseline** — all four PRs' `fitgolden.h` agree on `base_golden`
-   (`0x197291E6u / 0x47F69FFBu / 0xC9DED846u / 0xB0F10114u`). After each
-   rebase, knob-off must reproduce this table *and* foundation's
-   `cli_fit_golden.cmake` archive hashes.
-3. **Feature CRCs unchanged** — NAMO §3.3, #8 `SHRINK`/`MEAN`/`GATE_P2`,
-   FARO `erc_muon`/`malter_erc`, EMA mode tables. Any change is a merge bug,
-   not a measurement update.
-4. **Gate equivalence** — after unifying, run NAMO's `namo+c3` golden with
-   both `shrink_at` (old) and `step_shape.gate` (new) in one build and
-   compare raw bytes; the two must be identical, not merely within 1 ulp.
-5. **Build matrix** — GCC + Clang, `-Werror`, `-ffp-contract=off
-   -fno-fast-math` unchanged; GPU tests still skip/pass; no GLSL edits.
-
----
-
-## Appendix — the side-by-side NS check I actually ran
-
-I extracted the `ns_ortho()` function bodies from
-`struct-a@e682872:src/fit_opt.h` (lines 70-98) and
-`exp-namo@e40b8c0:src/fit_opt.h` (lines 16-44) and compared them as strings:
-
-```
-NS bodies byte-identical: True
-foundation constants: enum { NS_MAXDIM = 32, NS_MAXEL = NS_MAXDIM * NS_MAXDIM };
-namo constants:       #define NS_MAXDIM 32 / #define NS_MAXEL (NS_MAXDIM * NS_MAXDIM)
-```
-
-That is the whole arbitration: same algorithm, different packaging, and one
-ABI that can carry all four features.
+| #7 | `tuned[]` (4 rows, LR/WD knobs); drop the duplicate `shipped[]` | new `tests/test_tuned_lr.c`, `taw_test(tuned_lr)` |
+| #8 | `SHRINK`, `SHRINK_PLAIN`, `MEAN`, `MEAN_PLAIN`, `LAYERS1`, `SCOPE_COLD`, `BETA95`, `GATE_P2`, `gate_direct()`, distinctness CHECKs; drop `BASELINE[]` | `tests/test_c3_fit.c`, `taw_test(c3_fit)` (keep name; include `fit_gate.h` from `src/`) |
+| #10 | `cal`, `ident`, `calonly`, `apmonly`; drop `base[]`; convert `bool cal` → `.profile = 6` | `tests/test_cal_fit.c`, `taw_test(cal_fit)` (keep) |
+| #11 | `gate[]` (rewrite 6-field → 5-field + `fgold_opts`); drop inlined helper and `base[]` | new `tests/test_gate_fit.c`, `taw_test(gate_fit)` (new target — today it hides inside `fitgolden`) |
+| #13 | `hnet[]` (rewrite with opts); drop duplicate `base[]` | `tests/test_hnet_fit.c`, `taw_test(hnet_fit)` (keep); also keep `taw_test(hnet)` (profile unit test, distinct) |
+| #15 | `goldens[]` (`dfgold`) and `dyn_fit_check()` | `tests/test_dynfit.c`, `taw_test(dynfit)` (keep) |
+| #5 | `erc`, `erc_muon`, `malter`, `malter_erc`; drop `base[]` | `tests/test_faro_fit.c`, `taw_test(faro_fit)` (keep) |
+| #6 | `namo`, `namod`, `namo_gate`, `namod_row`, `namo_nest`; drop `base_golden[]` from header | `tests/test_namo.c`, `taw_test(namo)` (keep) |
+| #19 | `ema999_gold`, `swa_gold`, `ema9_gold`, `late_gold`, `malt_ab()`; drop `fitgolden_base[]` from header | `tests/test_ema.c`, `taw_test(ema)` (keep) |
+
+Final CTest inventory after all nine merges: the original 12 + `fitgolden` +
+9 arm targets (`tuned_lr`, `c3_fit`, `cal_fit`, `gate_fit`, `hnet_fit`,
+`dynfit`, `faro_fit`, `namo`, `ema`) + `hnet` + 5 CLI-fit tests
+(`cli_fit_c3`, `cli_fit_mix_seek`, `cli_fit_gate_seek`, `cli_fit_hnet_seek`,
+`cli_fit_faro_seek`) = **28 tests** (gpu skipped on this host). No name repeats.
+The CLI scripts stay as five distinct files (`cli_fit_c3.cmake`,
+`cli_fit_arms.cmake`, `cli_fit_hnet_seek.cmake`, plus #5's reuse of
+`cli_roundtrip.cmake`); their `WORK` dirs are already distinct.
+
+## 4. Per-merge conflict handling
+
+`tests/CMakeLists.txt` is modified by all ten worktrees and will conflict at
+every batch. Resolve in COMPAT.md batch order by **keeping the foundation
+block** (single `taw_test(fitgolden)`) and appending only the current PR's
+arm line(s) from the table above. Concretely:
+
+- Batch 2 (#5): delete its `fitgolden.h`, `test_fitgolden.c`, and its
+  `taw_test(fitgolden)` line; keep `faro_fit` + `cli_fit_faro_seek`.
+- Batch 3 (#8): its `fitgolden.h` goes; `test_c3_fit.c` switches to the
+  survivor header and loses the print early-out; keep `c3_fit` + `cli_fit_c3`.
+- Batch 4 (#6): header and `test_fitgolden.c` go; `base_golden[]` goes; keep
+  `namo` and add `fgold_env_scrub()`.
+- Batch 5 (#19): header and `test_fitgolden.c` go; `fit_probe`/
+  `fit_roundtrip` move up into the survivor header; keep `ema`.
+- Batch 6 (#15): no fitgolden file conflict; rename its local helper; keep
+  `dynfit`.
+- Batch 7 (#11): its inlined helper and baseline go; gate table moves to
+  `test_gate_fit.c`; replace `taw_test(fitgolden)` with `taw_test(gate_fit)`;
+  keep both `cli_fit_*_seek` names.
+- Batch 8 (#13): header and `test_fitgolden.c` go; rewrite tables with opts;
+  keep `hnet`, `hnet_fit`, `cli_fit_hnet_seek`.
+- Batch 9 (#10): header and `test_fitgolden.c` go; convert `bool cal`; keep
+  `cal_fit`.
+- #7 was batch 1: its `fitgolden.h`/`test_fitgolden.c` go; the tuned table
+  moves to `test_tuned_lr.c`; add that target.
+
+Acceptance check after each batch: `cmake --build build -j4 && ctest` green
+with no `add_executable ... same name` error, `golden_corpus.sh` still prints
+`golden corpus set OK (12 pairs)`, and `grep -c taw_test\(fitgolden\)` on
+`tests/CMakeLists.txt` is exactly **1**.
+
+## 5. The one-line COMPAT.md fix
+
+`COMPAT.md` says `ctest` is `12/12`; with `d08f019` it is `13/13`. The one-line
+substitution is **`12/12` → `13/13`**, applied at all three occurrences
+(the batch rule, batch 0's green condition, and the §4 build-command comment).
+Applied in this commit. Longer-term the count will change again with every
+merged arm (28 after all nine); the durable wording would be "all CTest tests
+green, gpu skipped", but that is a rewording, not the requested one-line fix.
+
+## 6. Compatibility keeper's conditional
+
+If two `taw_test(fitgolden)` registrations survive a batch, then the build
+fails before any archive is written — a loud failure, acceptable. If two
+*baseline tables* survive, then a maintainer can update one and leave the
+other pinning stale bytes — a silent failure, not acceptable. Hence the
+single header-owned `fitgolden_base[]` and the single surviving
+`test_fitgolden.c`. If an arm test keeps its own copy of the baseline, it is
+not an arm test; it is a fork of the invariant.

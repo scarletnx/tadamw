@@ -178,14 +178,14 @@ pulled into a batch to "resolve" an interaction here.
 
 ## 3. Staged merge plan
 
-Rule for every batch: after the merge, `ctest` is 12/12 (gpu skipped on this
+Rule for every batch: after the merge, `ctest` is 13/13 (gpu skipped on this
 host), §4 hashes are unchanged, and a decoder built from the previous batch
 can read every default archive produced by the new batch. Each batch is one
 revertible commit (or one PR merge) so rollback is `git revert -m 1 <merge>`.
 
 | Batch | Content (with required fixes) | Why this position | Green condition / rollback |
 |---|---|---|---|
-| **0 — infrastructure, no PR** | Land the §4 hash script + hash table, the central predictor/profile allocator test (I4), the knob-off golden test, and the cross-profile loader matrix skeleton. | Gives every later batch an objective pass/fail; no archive behaviour changes. | ctest 12/12 + hashes match. Rollback: delete new test files. |
+| **0 — infrastructure, no PR** | Land the §4 hash script + hash table, the central predictor/profile allocator test (I4), the knob-off golden test, and the cross-profile loader matrix skeleton. | Gives every later batch an objective pass/fail; no archive behaviour changes. | ctest 13/13 + hashes match. Rollback: delete new test files. |
 | **1 — docs/hygiene, no format** | **#7** (delete stale v1 TSV/logs, consolidate v2 into RESULTS.md/bench/results.tsv, make `sweep.py` portable or drop it, test `TAW_LR1=flat`) and **#21** (rename report to `RESULTS_MATRIX.md`, restore `.gitignore`, parameterise private paths, mark unmerged arms). | #7's tuned-AdamW config is the reference for #8; #21 is a decision record, not a mechanism. No profile/format state. | Hashes unchanged; `git check-ignore` passes. Rollback: revert both commits; no state to unwind. |
 | **2 — FARO-ERC** | **#5**: strip the routing lane (`faro_cf_probe/explore/ns_score`, `TAW_FARO_ROUTE/STAT/EXPLORE`), keep ERC only, fix the "no duplicate Muon" doc claim, add neutrality/risk-hook/knob-off tests. | Opt-in, default-off, no format. Landing before #6/#8 means only one NS duplicate is removed at a time. | Hashes unchanged; FARO-on deterministic vs MALTER control. Rollback: revert; no archive state. |
 | **3 — C3 gate owner** | **#8**: ship C3 shrink-only, remove C2/NC9 dead paths or label them reproduction-only, factor `adam_rows` body out of `adam_rows_adv`, remove `TAW_FORCE_SEL1/2`, add known-vector + per-corpus text1m-L1 guard. | Establishes single C3 ownership before #6 is allowed anywhere near a gate. | Hashes unchanged; gate known-vector test green. Rollback: revert. |
@@ -220,7 +220,7 @@ Do not substitute regenerated corpora: they change every hash.
 ```
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTADAMW_GPU=OFF
 cmake --build build -j4
-(cd build && ctest --output-on-failure)     # expect 12/12, gpu skipped
+(cd build && ctest --output-on-failure)     # expect 13/13, gpu skipped
 ```
 
 **Env scrub.** Each invocation is wrapped so no experiment knob leaks in:
