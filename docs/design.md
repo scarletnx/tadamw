@@ -33,6 +33,7 @@ drive a binary range coder (format.md §4).
 | profile 1 inputs | 12 adaptive integer context models (o0-o4, o6, word, 5 sparse), each giving a direct and an indirect (bit history) estimate, plus a match model: 25 inputs + bias |
 | profile 1 mixer | frozen MLP: one optional hidden layer (clamp ±8), weight sets picked by a selector context (the "table" part), fixed `dot4` summation order |
 | profile 1 output | integer squash, then two adaptive integer APM stages (c0, c1:c0) |
+| profile 2 | profile 1 with the chunk stage of arXiv 2507.07955 ("Dynamic Chunking for End-to-End Hierarchical Sequence Modeling"): a routing table fitted to the input cuts the bytes into chunks and lines, four context models are keyed by them, and the model names which ten of the fourteen hashed models run. Opt-in (`taw c -p chunk`, `TAW_PREDICTOR_CHUNK`). Smaller on every file of the bench below at level 5 (1.5% in total, 20% on the table-like one); the decoder runs profile 1's per-bit loop but is up to 19% slower on text, where the chunk models' lines miss the cache |
 
 ## Profile 1 in short
 
@@ -64,6 +65,121 @@ format.md §2.2 is normative; this is the reasoning.
   `s_r`. So scalar, AVX2 and AVX-512 agree by construction, and the tests
   check it. Four partial sums (rather than one running sum) shorten the
   add dependency chain without giving up exactness.
+
+## Profile 2 in short
+
+format.md §2.3 is normative; this is the reasoning.
+
+- **What the paper does.** H-Net reads raw bytes through a small encoder,
+  lets a routing module place a chunk boundary wherever the representation
+  of a position is dissimilar from the one before it (so the decision
+  needs only bytes already seen), runs its large network on the chunks
+  alone, and repeats each chunk's output over the bytes up to the next
+  boundary. Two stages (chunks of chunks) is its best model. The paper's
+  point is that this learned, causal segmentation replaces a tokenizer:
+  BPE is its baseline, not a part of it. A BPE vocabulary is fixed and
+  greedy, its boundaries depend on bytes that come later (a decoder cannot
+  place them from the bytes it has), and it has to be shipped or frozen.
+- **What that is here.** A large network per chunk is orders of magnitude
+  outside a decoder that spends one step per context model per bit. The
+  parts that survive the budget: the routing module becomes a table over
+  the last two bytes (a class per byte value and a 16x16 class matrix,
+  which is the paper's similarity test with a one-byte encoder and one bit
+  of similarity); the chunks become hashes; the network over chunks becomes
+  context models keyed by the chunk history, held until the next boundary
+  as the paper's upsampler holds a chunk vector; the second stage is a
+  second matrix that marks which chunk boundaries start a line, which
+  gives every chunk a place in its line and a chunk above it.
+- **The table is searched, not trained.** Hash tables carry no gradient.
+  The encoder scores a candidate table by the code length of a small
+  context mixer over a sample: a fixed base prediction (orders 1-4 and 6
+  and the word model, computed once) plus the four chunk contexts under
+  the candidate. A table therefore scores by what its chunks add to what
+  the mixer has anyway, not by how well they predict alone. Coordinate
+  descent from the best of three presets over the class of each frequent
+  byte and the bits of both matrices.
+- **Lanes, not more models.** A first version ran the chunk models beside
+  profile 1's twelve (15 models, 32 mixer inputs): text got 0.7-1% smaller,
+  binaries 0.1-0.9% larger (six more weights per mixer row, and noise),
+  and decoding was 21% slower (10 MB of enwik8: 7.54 s to 9.14 s). The
+  AVX2 kernels have 16 lanes, so the encoder's feature pass can run all
+  fourteen hashed candidates at once, and each model's inputs depend on
+  its own context alone: a model reads the same values in the 16-model
+  pass as in the decoder's lane (`tests/test_p2.c`,
+  `lanes_match_candidates`). So the encoder ranks the candidates with a
+  linear mixer on the samples, drops the four it misses least, and the
+  decoder runs ten hashed models through profile 1's own per-bit loop.
+  Text drops sparse models, binaries drop chunk models, tables drop low
+  orders.
+- **The same instructions are not the same time.** Decoding executes 3%
+  more instructions than profile 1 (the chunk state and the lane move, per
+  byte), and takes up to 19% longer (table below). On Dickens the user
+  cycles rose 12.7% (perf, before the lane move went into registers), and 58% of that rise is inside the per-bit loop,
+  which executes the same instructions as before: a sparse model on text
+  has few distinct contexts, so its lines stay in the cache, and a chunk
+  model that takes its lane has about as many as the high orders. Asking
+  Linux for huge pages removed a third of profile 1's TLB misses and none
+  of this. Files where every model's lines were cold already (x-ray) lose
+  nothing. Not tried: smaller tables for the chunk lanes only, and a
+  ranking that charges a chunk model for the lane it takes.
+- **Never much worse than profile 1.** The ranking is a linear proxy for
+  the MLP. The encoder also fits profile 1's ten lanes on the same samples
+  and keeps the smaller estimate, so a misleading ranking costs the ten
+  lane bytes. With those lanes the model has no routing table and the
+  profile computes what profile 1 does (the golden test checks the coded
+  bytes are identical).
+- **Where it pays.** Lines and columns first (a chemical database, XML, a
+  database dump), then prose, then everything else by a little.
+
+Measured on enwik8 and the twelve files of the Silesia corpus (312 MB),
+`-p chunk` against `-p mix`, one thread, Ryzen 5 7500F; every archive was
+decoded and compared with its input:
+
+| file | MB | profile 1, level 5 | profile 2, level 5 | change | change at level 1 | profile 2's lanes at level 5 drop |
+|------|---:|---:|---:|---:|---:|---|
+| enwik8 | 100.0 | 22 238 343 | 21 973 768 | -1.19% | -0.73% | s23 s24 s1278 above |
+| mozilla | 51.2 | 13 515 038 | 13 417 915 | -0.72% | -0.26% | o3 o4 o6 s14 |
+| webster | 41.5 | 6 675 388 | 6 584 214 | -1.37% | -0.57% | s23 s34 s24 prev |
+| nci | 33.6 | 1 595 639 | 1 276 296 | -20.01% | -14.09% | o4 s24 prev col |
+| samba | 21.6 | 3 403 068 | 3 355 861 | -1.39% | -1.03% | s23 s24 prev col |
+| dickens | 10.2 | 2 347 300 | 2 317 791 | -1.26% | -1.69% | s23 s34 s24 above |
+| osdb | 10.1 | 2 410 632 | 2 339 697 | -2.94% | -0.52% | word s14 s1278 above |
+| mr | 10.0 | 2 252 046 | 2 239 748 | -0.55% | -0.32% | word s14 s1278 prev |
+| x-ray | 8.5 | 3 737 521 | 3 730 434 | -0.19% | -0.09% | o3 word s1278 above |
+| sao | 7.3 | 4 537 780 | 4 504 759 | -0.73% | -0.21% | o4 s23 s24 s14 |
+| reymont | 6.6 | 1 042 554 | 1 025 682 | -1.62% | +0.18% | o3 o4 s24 s14 |
+| ooffice | 6.2 | 2 166 194 | 2 149 675 | -0.76% | +0.00% | o3 o4 o6 above |
+| xml | 5.3 | 386 081 | 368 328 | -4.60% | -0.34% | o6 s24 s14 s1278 |
+| total | 311.9 | 66 307 584 | 65 284 168 | -1.54% | -0.86% | |
+
+Level 1 uses a preset table without searching it, which is most of the
+difference on XML and the database dump.
+
+Decoding, seconds, median of two interleaved runs:
+
+| file | profile 1 before this (e64cc83) | profile 1 | profile 2 | profile 2 against profile 1 |
+|------|---:|---:|---:|---:|
+| dickens | 7.58 | 7.57 | 8.98 | +18.7% |
+| xml | 3.24 | 3.26 | 3.78 | +16.1% |
+| nci | 18.80 | 19.04 | 20.02 | +5.1% |
+| osdb | 8.41 | 8.46 | 8.70 | +2.8% |
+| x-ray | 8.11 | 8.08 | 8.13 | +0.7% |
+
+Encoding at level 5, seconds, median of three runs: 10 MB of enwik8 18.1
+with profile 1 and 77.4 with profile 2; the XML file (5 MB) 9.8 and
+66.2. The difference, 59 s and 56 s, hardly moves with the input size:
+it is mostly the routing search, then the 16-model feature pass and the
+second fit.
+
+- **Tried, not kept:** a third chunk n-gram (chunk with the two before
+  it) lost to the place-in-line context wherever lines exist and was
+  within noise on prose; the chunk above without the place was 2% worse on
+  the table-like file; a remembered line of 16 chunks was 1-1.5% worse on
+  structured files than 32, and 32 was 4.7% worse than 64 on the
+  table-like file (128 and 256 change nothing more there; 128 is 0.1%
+  better than 64 on XML). A fixed rule (letters join, every
+  other byte alone, the profile 1 word model's rule) gave about two thirds
+  of the searched table's gain on English text and nothing on tables.
 
 ## Decoder performance
 
@@ -217,6 +333,13 @@ parallel (`taw d -j N`, `taw_seek_set_threads`): 5 blocks went from
    load the bytes through the decoder's own loader, and estimate
    `bits/bit × 8n + 8 × model bytes` on the samples with the real
    inference code. Keep the best.
+   Profile 2 (`predictor = chunk`) differs in steps 3 and 4: before the
+   feature pass it searches the routing table ("Profile 2 in short"), the
+   pass runs all fourteen hashed models (16 lanes), the lanes are chosen
+   on the samples, and the candidates are fitted twice, for the chosen
+   lanes and for profile 1's. A net reads its inputs from the 33-input
+   samples through a map of its lanes, so both fits (and the GPU trainer)
+   use the one sample set.
 7. Code the input with profile 1. For `.aw` with `predictor = auto`, also
    code it with profile 0 and keep the smaller archive. `.awseek` streams
    through `taw_seek_encode` instead. It codes each block once with the chosen
@@ -238,8 +361,28 @@ Level sets the effort only:
 | 8 | 4 Mi | 6 | 10 |
 | 9 | 4 Mi | 8 | 12 |
 
+Profile 2's routing search, by level (sample, how many of the most
+frequent bytes get their class searched, sweeps):
+
+| level | sample | bytes | sweeps |
+|-------|--------|-------|--------|
+| 1 | 256 KiB | presets only | - |
+| 2 | 256 KiB | 0 (matrices only) | 1 |
+| 3 | 512 KiB | 16 | 1 |
+| 4 | 512 KiB | 32 | 1 |
+| 5 | 512 KiB | 48 | 1 |
+| 6 | 1 MiB | 64 | 1 |
+| 7 | 1 MiB | 96 | 2 |
+| 8 | 1 MiB | 128 | 2 |
+| 9 | 1 MiB | 256 | 2 |
+
+One candidate table costs a pass of the small mixer over the sample;
+level 5 tries several hundred, so the search is a fixed
+cost of about a minute on one thread (measured above) that small inputs
+feel most. Candidates are scored on `threads` workers.
+
 `TAW_FIT_DEBUG=1` in the environment prints every fitted candidate to
-stderr, whether the GPU was used (or why not) and the fitting time;
+stderr, the routing search and the lanes ranking, whether the GPU was used (or why not) and the fitting time;
 `TAW_FIT_DEBUG=a` fits all candidates (slow; that is how the prior was
 calibrated).
 
@@ -398,17 +541,17 @@ the partial ones at the edges through a per-thread buffer. The source's
 | `src/crc32c.c`, `src/crc32c_sse42.c` | CRC-32C: slicing-by-8, SSE4.2 |
 | `src/pool.c` | worker threads (`taw_parallel`) |
 | `src/rc.c` | binary range coder (format.md §4) |
-| `src/predictor.c` | arithmetic profiles: dispatch, profile 0, profile 1 APM and per-bit loop |
-| `src/p1.h` | profile 1 internal interface and constants |
-| `src/p1_ctx.c` | profile 1 context models, squash/stretch tables |
-| `src/p1_net.c` | profile 1 model parsing, dequantization, scalar mixer, ISA choice |
+| `src/predictor.c` | arithmetic profiles: dispatch, profile 0, the APM and per-bit loop of profiles 1 and 2 |
+| `src/p1.h` | internal interface and constants of profiles 1 and 2; profile 2's routing rule and chunk state |
+| `src/p1_ctx.c` | context models of profiles 1 and 2 (lanes, the 16-model feature pass), squash/stretch tables |
+| `src/p1_net.c` | model parsing of profiles 1 and 2, dequantization, scalar mixer, ISA choice |
 | `src/p1_avx2.c` | AVX2/F16C kernels: context-model inputs/update, hashes, mixer, F16 load |
 | `src/p1_run_avx2.c` | the fused AVX2 per-bit loop (encode, decode, skip) |
 | `src/p1_avx512.c` | AVX-512F mixer (used by `p1_net_eval`; the per-bit loop runs the fused AVX2 code) |
 | `src/p1_simd_out.h` | mixer pieces shared by the AVX2 and AVX-512 files |
 | `src/half.h` | binary16 conversions |
 | `src/quant.c` | weight row formats: sizes, validated decoding, the encoder's quantizer |
-| `src/fit.c` | encoder: feature pass, candidates, AdamW, quantization, choice, CPU/GPU split |
+| `src/fit.c` | encoder: feature pass, candidates, AdamW, quantization, choice, CPU/GPU split; profile 2's routing search and lane choice |
 | `src/fit_internal.h` | samples, the trainable net and the training schedule, shared by the two trainers |
 | `src/fit_gpu.c` | GPU trainer: Vulkan via `dlopen`, buffers, the command buffer (a stub without `TADAMW_GPU`) |
 | `src/fit_gpu_prep.comp`, `src/fit_gpu.comp` | its compute shaders: batch preparation, training |
@@ -421,6 +564,27 @@ the partial ones at the edges through a per-thread buffer. The source's
 | `tests/` | CTest executables + CLI roundtrip script |
 
 ## Open items
+
+- Profile 2 decodes up to 19% slower than profile 1 on text ("Profile 2
+  in short"). The ideas left are a smaller table for the chunk lanes, so
+  that their lines stay in the cache, and a lane ranking that counts what
+  a cold model costs.
+- Profile 2's routing search is brute force: every candidate table is a
+  full pass over the sample. Changing one class or matrix bit moves only
+  the chunks around the byte pairs it touches, so an incremental score
+  would cut it by an order of magnitude. The search also keeps the three
+  presets as its only starts.
+- Profile 2 has two levels (chunks, lines). The table is a function of
+  two bytes, so it cannot find fixed-length binary records, which have no
+  delimiter; the sparse models still cover those.
+- `predictor = auto` does not try profile 2. It would have to fit and code
+  the input a second time.
+- The feature pass keeps every `8n / samples`-th bit. When that stride is
+  a multiple of a record length in the data (a 4 MiB file of 16-bit
+  samples at level 3 keeps one byte of every 8), the samples see one byte
+  phase only and the fit, of either profile, is poor: the estimate was
+  0.07 bits per bit where the file codes at 2.4. Found while measuring
+  profile 2; not fixed here.
 
 - Decoder speed: about 1 MB/s per thread with AVX2 (see "Decoder
   performance"), and `.awseek` scales with threads across blocks. Ideas
