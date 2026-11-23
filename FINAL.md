@@ -9,10 +9,10 @@ All ten heads matched; no fetch, no corpus change, no sibling edit, no push.
 If a decoder from main reads this archive, then the archive must still be
 main's — and if a golden test is the only thing standing between a merge and a
 silent default change, then that test must compile under the strictest build
-and be registered exactly once. Two staged deviations and one duplicate target
-break that condition.
+and be registered exactly once. F1 and F3 are now resolved in the canonical
+branch; one duplicate target (F2) remains.
 
-## Verdict: **NOT CLEAN — three fixes required** (none is a format regression)
+## Verdict: **ONE FIX REMAINS — F2 only** (F1 and F3 resolved; no format regression)
 
 ### Checked and clean
 
@@ -36,13 +36,13 @@ break that condition.
 - **Alias compatibility holds.** NAMO's `base_golden` is a macro alias, not a
   second table; EMA's `fit_probe`/`fit_roundtrip`/`fitgolden_base`/
   `FITGOLDEN_BASE_N` names are present in the canonical header.
-- **COMPAT.md counts are consistent right now:** the canonical branch says
-  `13/13`, and no builder registers an extra target on main. (Forward-looking
-  caveat in F3.)
+- **COMPAT.md counts are durable:** the three brittle `13/13` occurrences were
+  replaced with "base suite green; per-arm targets added by each PR must also
+  pass" (F3 resolved), so the document does not expire at the first arm merge.
 - **#21** has no test changes, restored the upstream `.gitignore` patterns,
   and keeps its report out of the way of the other `RESULTS.md` writers.
 
-### F1 — BLOCKER: canonical header fails `-Werror`, and both staged workarounds fork or blanket-suppress
+### F1 — RESOLVED: canonical header failed `-Werror`; both staged workarounds were rejected
 
 Measured on this worktree:
 
@@ -88,6 +88,16 @@ it:
 5. Keep the prohibition comment — an env var must never turn goldens into
    no-ops.
 
+**RESOLVED in this worktree:** steps 1–2 are applied — the portable
+`TAW_TEST_UNUSED` macro now annotates all seven shared static helpers in the
+canonical `tests/fitgolden.h`. Re-verified:
+`cc -c -std=c2x -O2 -Wall -Wextra -Wpedantic -Werror ... test_fitgolden.c`
+returns **rc=0** (was rc=1). The `fgold` layout, six-row base table,
+`base_golden` alias and `fgold_env_scrub()` are byte-for-byte unchanged.
+Steps 3–5 remain per-PR batch actions: re-copy the patched header to all nine
+carrying branches, drop #15's private variant, and drop #13's two
+`-Wno-unused-function` lines.
+
 ### F2 — BLOCKER: duplicate `taw_test(fit_opt)` between #5 and #6
 
 Both final branches add the identical `tests/test_fit_opt.c` (blob
@@ -105,18 +115,20 @@ No other cross-branch target or CLI test name repeats; the nine CLI fit names
 `cli_fit_namo_seek`, `cli_fit_c3`, `cli_fit_mix_seek`, `cli_fit_gate_seek`,
 `cli_fit_hnet_seek`, `cli_fit_ema_seek`) are all distinct.
 
-### F3 — ADVISORY: COMPAT.md's count expires at the first arm merge
+### F3 — RESOLVED: COMPAT.md's brittle count expired at the first arm merge
 
-`13/13` is correct for the canonical branch alone. After all nine batches the
+`13/13` was correct for the canonical branch alone; after all nine batches the
 suite is **33 tests** (12 original + `fitgolden` + 9 arm targets + `fit_opt` +
-`hnet` + 9 CLI fit tests), gpu skipped. Either update the count at each batch
-or replace the three numeric occurrences with the durable wording "all CTest
-tests green, gpu skipped". This is not a merge blocker on main today.
+`hnet` + 9 CLI fit tests), gpu skipped. All three numeric occurrences in
+COMPAT.md were replaced with the durable condition "base suite green;
+per-arm targets added by each PR must also pass", so the document no longer
+expires at the first batch. No code or golden value changed.
 
 ## Closing conditional
 
 If F1 is not applied, then a `-DTADAMW_WERROR=ON` build of every arm that uses
 only part of the canonical header fails, and maintainers will keep forking the
-header to work around it. If F2 is not applied, then batches 2 and 4 cannot
-both be green. If F3 is ignored, then the golden corpus still passes but the
-document lies about the test count. Until all three are closed: **NOT GREEN**.
+header to work around it — **F1 is applied and verified (rc=0)**. If F2 is not
+applied, then batches 2 and 4 cannot both be green — **F2 remains open**. If F3
+is ignored, then the golden corpus still passes but the document lies about
+the test count — **F3 is resolved**. Until F2 is closed: **NOT GREEN**.

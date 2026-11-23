@@ -13,6 +13,17 @@
 #ifndef TAW_TESTS_FITGOLDEN_H
 #define TAW_TESTS_FITGOLDEN_H
 
+/* A translation unit may use only one of the helpers below (a base-only
+ * test uses fit_check, an EMA-style arm uses fit_probe). Mark the shared
+ * static helpers as intentionally unused where needed so -Werror builds do
+ * not force each arm to fork this header or pass -Wno-unused-function.
+ * Portable fallback for compilers without __attribute__((unused)). */
+#if defined(__GNUC__) || defined(__clang__)
+#define TAW_TEST_UNUSED __attribute__((unused))
+#else
+#define TAW_TEST_UNUSED
+#endif
+
 #define _POSIX_C_SOURCE 200809L /* C_EXTENSIONS OFF, C23: setenv/unsetenv */
 #include <stddef.h>
 #include <stdint.h>
@@ -45,7 +56,7 @@ typedef struct {
 /* Remove every inherited TAW_* knob (including ones a future PR will add).
  * Collect first: unsetenv() may compact environ while we walk it. Every
  * baseline or arm main() must call this before setting its own knobs. */
-static void fgold_env_scrub(void)
+static TAW_TEST_UNUSED void fgold_env_scrub(void)
 {
 	extern char **environ;
 	char names[128][128];
@@ -68,7 +79,7 @@ static void fgold_env_scrub(void)
 }
 
 /* One deterministic 1 MiB text source, shared by every probe. */
-static const uint8_t *fit_source(void)
+static TAW_TEST_UNUSED const uint8_t *fit_source(void)
 {
 	enum { N = 1 << 20 };
 	static uint8_t *src;
@@ -87,7 +98,7 @@ typedef struct {
 	uint8_t profile;
 } fgold_seen;
 
-static void fgold_fit(int level, taw_weights w, taw_predictor pred,
+static TAW_TEST_UNUSED void fgold_fit(int level, taw_weights w, taw_predictor pred,
     fgold_seen *seen, void **arc_out, size_t *an_out)
 {
 	enum { N = 1 << 20 };
@@ -112,7 +123,7 @@ static void fgold_fit(int level, taw_weights w, taw_predictor pred,
 
 /* #19-compatible helper names: an arm that used the old header compiles
  * unchanged when it includes this one. */
-static void fit_probe(int level, taw_weights w, fgold *g, void **arc_out,
+static TAW_TEST_UNUSED void fit_probe(int level, taw_weights w, fgold *g, void **arc_out,
     size_t *an_out)
 {
 	fgold_seen seen;
@@ -120,7 +131,7 @@ static void fit_probe(int level, taw_weights w, fgold *g, void **arc_out,
 	*g = seen.g;
 }
 
-static void fit_roundtrip(const void *arc, size_t an)
+static TAW_TEST_UNUSED void fit_roundtrip(const void *arc, size_t an)
 {
 	enum { N = 1 << 20 };
 	const uint8_t *src = fit_source();
@@ -133,7 +144,7 @@ static void fit_roundtrip(const void *arc, size_t an)
 
 /* Assert every row's signature, with optional predictor/profile checks, and
  * require the archive to round-trip. */
-static void fit_check_ex(const char *arm, const fgold *g, size_t ng,
+static TAW_TEST_UNUSED void fit_check_ex(const char *arm, const fgold *g, size_t ng,
     const fgold_opts *o)
 {
 	taw_predictor pred = o ? o->pred : TAW_PREDICTOR_MIX;
@@ -163,7 +174,7 @@ static void fit_check_ex(const char *arm, const fgold *g, size_t ng,
 	}
 }
 
-static void fit_check(const char *arm, const fgold *g, size_t ng)
+static TAW_TEST_UNUSED void fit_check(const char *arm, const fgold *g, size_t ng)
 {
 	fit_check_ex(arm, g, ng, NULL);
 }
