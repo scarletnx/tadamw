@@ -32,8 +32,12 @@ static void usage(FILE *f)
 	    "\n"
 	    "  c   compress (.awseek output or -s gives the seekable variant)\n"
 	    "      -l 1..9          fitting effort (default 5)\n"
-	    "      -p auto|order0|mix  predictor (default auto: the fitted mixer\n"
-	    "                       if it beats order0)\n"
+	    "      -p auto|order0|mix|cal|gate|hnet\n"
+	    "                       predictor (default auto: the fitted mixer\n"
+	    "                       if it beats order0). cal/gate/hnet are the\n"
+	    "                       allocated predictor slots 6/11/14; they are\n"
+	    "                       TAW_E_ARG until the owning profile lands.\n"
+	    "                       Values 3..5, 7..10 and 12..13 are void.\n"
 	    "      -w auto|f16|q8|q4|q2|fp8|nvfp4|iq8|iq4|iq2\n"
 	    "                       mixer weight format (default auto)\n"
 	    "      -j N             worker threads (default 1)\n"
@@ -121,7 +125,6 @@ static bool parse_u64(const char *s, uint64_t *v)
 }
 
 #if TAW_HAVE_ENCODER
-static const char *const predictors[] = {"auto", "order0", "mix", nullptr};
 static const char *const weights[] = {"auto", "f16", "q8", "q4", "q2", "fp8",
 	"nvfp4", "iq8", "iq4", "iq2", nullptr};
 static const char *const gpus[] = {"off", "auto", "on", nullptr};
@@ -137,6 +140,32 @@ static bool parse_choice(const char *s, const char *const *names,
 	return false;
 }
 
+/* Predictor values are NOT array indices: R-4 allocates them to equal the
+ * arithmetic profile ID. A sparse name table keeps the CLI and the public
+ * enum in agreement; value 3 has no name. */
+static const struct {
+	const char *name;
+	taw_predictor value;
+} predictor_names[] = {
+	{"auto", TAW_PREDICTOR_AUTO},
+	{"order0", TAW_PREDICTOR_ORDER0},
+	{"mix", TAW_PREDICTOR_MIX},
+	{"cal", TAW_PREDICTOR_CALIBRATED},
+	{"gate", TAW_PREDICTOR_GATE},
+	{"hnet", TAW_PREDICTOR_HNET},
+};
+
+static bool parse_predictor(const char *s, taw_predictor *out)
+{
+	for (size_t i = 0; i < sizeof predictor_names / sizeof *predictor_names;
+	     i++)
+		if (strcmp(s, predictor_names[i].name) == 0) {
+			*out = predictor_names[i].value;
+			return true;
+		}
+	return false;
+}
+
 #endif
 
 static const char *profile_name(unsigned p)
@@ -144,6 +173,9 @@ static const char *profile_name(unsigned p)
 	switch (p) {
 	case 0: return "INT_ORDER0";
 	case 1: return "F32_STRICT_MIX";
+	case 6: return "CALIBRATED_MIX";
+	case 11: return "ENTROPY_GATE";
+	case 14: return "HNET_BOUNDARY";
 	default: return "?";
 	}
 }
@@ -169,8 +201,7 @@ static int cmd_compress(int argc, char **argv)
 			p.level = (int)v;
 			i++;
 		} else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc &&
-		    parse_choice(argv[i + 1], predictors, &v)) {
-			p.predictor = (taw_predictor)v;
+		    parse_predictor(argv[i + 1], &p.predictor)) {
 			i++;
 		} else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc &&
 		    parse_choice(argv[i + 1], weights, &v)) {

@@ -43,6 +43,31 @@ allocated by this ledger: quant ids `5..11` (`Q4`, `Q2`, `FP8`, `NVFP4`,
 `IQ8`, `IQ4`, `IQ2`) stay exactly as specified in §3, and every retained
 profile uses the profile-1 quant set. §2.3 and §5.2 are sealed (see below).
 
+### Predictor enum (`taw_predictor`, API only)
+
+The public `taw_predictor` selector is an encoder-side choice and is **not**
+stored in an archive: header bytes 6 and 7 carry `arith_profile` and `quant`.
+This allocation is integration ruling R-4; it does not change the
+arithmetic-profile table above, which remains the sole authority for profile
+IDs.
+
+| value | enum name | profile | status |
+|-------|-----------|---------|--------|
+| 0 | `TAW_PREDICTOR_AUTO` | — | grandfathered |
+| 1 | `TAW_PREDICTOR_ORDER0` | 0 | grandfathered (legacy value) |
+| 2 | `TAW_PREDICTOR_MIX` | 1 | grandfathered (legacy value) |
+| 6 | `TAW_PREDICTOR_CALIBRATED` | 6 | allocated (PR #10) |
+| 11 | `TAW_PREDICTOR_GATE` | 11 | allocated (PR #11) |
+| 14 | `TAW_PREDICTOR_HNET` | 14 | allocated (PR #13) |
+
+Values `3..5`, `7..10`, `12..13` and `15..255` are refused:
+`taw_params_resolve()` returns `TAW_E_ARG` and the CLI offers no name for
+them. Value 11 is the only allocated value in the nominal `7..13` range,
+because predictor values equal their profile IDs. The early-prototype value
+3 is **void**: it was never allocated, was claimed by mutually incompatible
+PRs, and never shipped in a merged build. No predictor value is assigned to
+the denied or held profile IDs 3, 7, 8, 10 or 12.
+
 ## 1. File header (32 bytes)
 
 | off | size | field          | notes |
@@ -359,18 +384,24 @@ the `REGISTRY.md` ruling.
 Allocated placeholder. The normative arithmetic is introduced by PR #10 and
 is not part of this base; when that PR lands, its §2.3 text is renumbered to
 §2.6 (and its §5.2 text to §5.6). Until then `arith_profile = 6` is refused.
-See the `REGISTRY.md` ruling.
+Predictor slot `TAW_PREDICTOR_CALIBRATED = 6` / CLI `-p cal` is allocated by
+integration ruling R-4. See the `REGISTRY.md` ruling.
 
 ### 2.11 Profile 11: `ENTROPY_GATE` (PR #11)
 
 Allocated placeholder. Normative text arrives with PR #11 as §2.11 / §5.11.
-Until then `arith_profile = 11` is refused. See the `REGISTRY.md` ruling.
+Until then `arith_profile = 11` is refused. Predictor slot
+`TAW_PREDICTOR_GATE = 11` / CLI `-p gate` is allocated by integration ruling
+R-4. See the `REGISTRY.md` ruling.
 
 ### 2.14 Profile 14: `HNET_BOUNDARY` (PR #13)
 
 Allocated placeholder. PR #13 already uses §2.14; on landing, its model text
 becomes §5.14 rather than an edit to the shared §5.1 validation text. Until
-then `arith_profile = 14` is refused. See the `REGISTRY.md` ruling.
+then `arith_profile = 14` is refused. Predictor slot `TAW_PREDICTOR_HNET =
+14` / CLI `-p hnet` is allocated by integration ruling R-4; predictor value 3
+is void and `3..5`, `7..10`, `12..13` are refused. See the `REGISTRY.md`
+ruling.
 
 ## 3. Quantization formats
 

@@ -77,12 +77,21 @@ typedef enum {
 } taw_gpu_mode;
 
 /* Predictor choice. AUTO fits the mixer and keeps it only if the archive
- * comes out smaller than with the order-0 placeholder. */
+ * comes out smaller than with the order-0 placeholder. The predictor is an
+ * encoder-side API value, not an archive field (see docs/format.md §1).
+ *
+ * Integration ruling R-4: a new predictor's value equals its arithmetic
+ * profile ID. AUTO/ORDER0/MIX are grandfathered at 0/1/2. Values 3..5,
+ * 7..10, 12..13 and 15..255 are refused (TAW_E_ARG); value 3 from the early
+ * prototypes is void — never allocated, never shipped in a merged build. */
 typedef enum {
 	TAW_PREDICTOR_AUTO = 0,
-	TAW_PREDICTOR_ORDER0, /* arith profile 0 */
-	TAW_PREDICTOR_MIX,    /* arith profile 1; TAW_E_ARG if the input is
-	                         too small for any model */
+	TAW_PREDICTOR_ORDER0 = 1, /* legacy value; arith profile 0 */
+	TAW_PREDICTOR_MIX = 2,    /* legacy value; arith profile 1; TAW_E_ARG
+	                             if the input is too small for any model */
+	TAW_PREDICTOR_CALIBRATED = 6, /* arith profile 6, PR #10 */
+	TAW_PREDICTOR_GATE = 11,      /* arith profile 11, PR #11 */
+	TAW_PREDICTOR_HNET = 14,      /* arith profile 14, PR #13 */
 } taw_predictor;
 
 /* Weight format for the mixer (docs/format.md §3). AUTO lets the encoder
