@@ -1,134 +1,108 @@
-# FINAL.md — Compatibility Keeper's final-pass verification
+# FINAL.md — last knob-surface pass
 
-Base of record: canonical `integration/golden-canonical` @ `14b1c0f` in this
-worktree. Final staged branches checked read-only at the requested SHAs:
-#5 `6db34ea`, #6 `d8506fc`, #7 `fb81c4d`, #8 `a7457ec`, #10 `8906f3b`,
-#11 `0a91327`, #13 `92638a7`, #15 `af4e989`, #19 `d3368de`, #21 `fb0d51f`.
-All ten heads matched; no fetch, no corpus change, no sibling edit, no push.
+> Clipboard out, pen uncapped. "Clean" is a word I only write when every name
+> on the clipboard is a name in the code — and vice versa. **This is not clean.**
 
-If a decoder from main reads this archive, then the archive must still be
-main's — and if a golden test is the only thing standing between a merge and a
-silent default change, then that test must compile under the strictest build
-and be registered exactly once. F1 and F3 are now resolved in the canonical
-branch; one duplicate target (F2) remains.
+Scope: read-only audit of the ten final staged branches at the exact SHAs
+named in the request, compared against canonical `integration/knob-final`
+@ `b1dadf9` (`docs/design.md` env-knob section, `README.md`, `KNOBS.md`,
+`RECONCILE.md`, `INTEGRATION.md`). No sibling worktree was modified; no push.
 
-## Verdict: **ONE FIX REMAINS — F2 only** (F1 and F3 resolved; no format regression)
+## Verdict per PR
 
-### Checked and clean
+| PR | SHA | drift names in live knob surface | undocumented live knobs | default byte-identical | GPU guard | verdict |
+|----|-----|----------------------------------|-------------------------|------------------------|-----------|---------|
+| #5 FARO | `6db34ea` | none in knobs; **1 stale code comment** | none | ✓ | FARO→CPU ✓ documented | **DRIFT (comment)** |
+| #6 NAMO | `d8506fc` | none | none | ✓ | shared C3 guard via #8 ✓ | MATCH |
+| #7 flat LR | `fb81c4d` | none | none | ✓ | n/a | MATCH |
+| #8 EPS gate | `a7457ec` | none in knobs; **1 stale code comment** | `TAW_DATA` (harness only) | ✓ | C3→`TAW_E_ARG` ✓ documented | **DRIFT (comment)** |
+| #10 calibrated | `8906f3b` | none | profile-6 predictor CLI missing from canonical registry | ✓ | CPU-only, documented | **DRIFT (canonical doc)** |
+| #11 gate | `0a91327` | none | none | ✓ | n/a | MATCH |
+| #13 hnet | `92638a7` | none | none | ✓ | n/a | MATCH |
+| #15 dynamic blocks | `af4e989` | none | **`-D`/`-T`/`-C` + 4 API fields absent from canonical registry** | ✓ | n/a | **DRIFT (canonical registry)** |
+| #19 EMA | `d3368de` | none | harness `TAW`/`TAW_BENCH_DATA` only | ✓ (`TAW_AVG_OFF`) | GPU nets not averaged ✓ | MATCH |
+| #21 matrix | `fb0d51f` | old tokens only in appendix ✓ | `BENCH_*` documented in its own RESULTS | ✓ pin intact | n/a | MATCH |
 
-- **One fitgolden helper per worktree.** Eight of the nine fitgolden-carrying
-  PRs have `tests/fitgolden.h` byte-identical to canonical (SHA `4dd99584…`);
-  #15's copy is canonical **plus** the unused attribute only (see F1). No PR
-  carries a second helper, a private baseline table, or a private
-  `fit_check()` definition.
-- **One `test_fitgolden.c` and one `taw_test(fitgolden)`** per worktree where
-  present (#6 and #21 legitimately have neither; #6 consumes `base_golden`
-  from the canonical header). Counts: 1 for #5/#7/#8/#10/#11/#13/#15/#19 and
-  the canonical branch, 0 for #6/#21. No worktree has two.
-- **No assertion bypass.** The only `TAW_GOLDEN_PRINT` occurrences in any
-  final branch are the canonical header's *prohibition comment*. No env var,
-  `#if`, or CTest property turns a golden assertion into a no-op.
-- **No incompatible `fgold` layout.** Every `fgold` table in every final arm
-  is the canonical five-field positional form; predictor/profile arms use
-  `fit_check_ex()` with `fgold_opts` (#10 `.profile = 6`, #11 `.profile = 11`,
-  #13 `.profile = 14`). #15's `dfgold` is a separate container struct and its
-  helper was renamed `dyn_fit_check`, as specified.
-- **Alias compatibility holds.** NAMO's `base_golden` is a macro alias, not a
-  second table; EMA's `fit_probe`/`fit_roundtrip`/`fitgolden_base`/
-  `FITGOLDEN_BASE_N` names are present in the canonical header.
-- **COMPAT.md counts are durable:** the three brittle `13/13` occurrences were
-  replaced with "base suite green; per-arm targets added by each PR must also
-  pass" (F3 resolved), so the document does not expire at the first arm merge.
-- **#21** has no test changes, restored the upstream `.gitignore` patterns,
-  and keeps its report out of the way of the other `RESULTS.md` writers.
+What is genuinely clean: every product knob name/default in the final code
+matches the live tables — `TAW_FARO*` (no route knob), `TAW_NAMO_NEST` (no
+`TAW_NAMO_GATE`), `TAW_MUON_NEST` back to `1`, `TAW_EPS_GATE_MODE`, no
+`TAW_EPS_GRAN`, invalid `TAW_EPS_MODE` now returns `TAW_E_ARG`,
+`TAW_FIT_AVG` default `off` with `auto` gone, `TAW_CALIBRATED` default `0`.
+#21's pre-rename tokens are confined to its appendix with warnings and are
+covered by the canonical "Historical names" appendix. Both GPU guards are
+documented with their correct asymmetry.
 
-### F1 — RESOLVED: canonical header failed `-Werror`; both staged workarounds were rejected
+## Exact drift — required fixes
 
-Measured on this worktree:
+**D1 — stale drift-name comment (blocking the "no live drift names" claim).**
+`src/fit_opt.c:15` in **both** #5 `6db34ea` and #8 `a7457ec` reads:
 
-```
-cc -c -std=c2x -O2 -Wall -Wextra -Wpedantic -Werror \
-   -Iinclude -Ibuild/include -Isrc -Itests tests/test_fitgolden.c
--> error: 'fit_probe' defined but not used [-Werror=unused-function]   (rc=1)
-
-same compile against #15's fitgolden.h -> rc=0
+```c
+/* The single sign-consistency gate, verbatim from staged #8 (af5fd00). Both
+ * #8's TAW_EPS_MODE=c3 and #6's TAW_NAMO_GATE=c3 must call this, not copy it. */
 ```
 
-Root cause: the canonical header ships seven `static` helpers; an arm that
-uses only `fit_check()` leaves `fit_probe()` unused. Both PRs patched around
-it:
+`TAW_NAMO_GATE` no longer exists in final #6 (`d8506fc` uses the shared
+`TAW_EPS_MODE=c3`). Fix:
 
-- #15 adds `TAW_TEST_UNUSED` (`__attribute__((unused))` with a portable empty
-  fallback) to all seven helpers — targeted, portable, and it works — but it
-  lives in a **private copy of the canonical header**, which reintroduces the
-  duplicate-helper problem the whole harness was built to remove.
-- #13 adds `target_compile_options(test_fitgolden PRIVATE -Wno-unused-function)`
-  and the same for `test_hnet_fit` — a blanket suppression that would hide
-  genuinely dead code in those test files. Not acceptable.
+```diff
+- * #8's TAW_EPS_MODE=c3 and #6's TAW_NAMO_GATE=c3 must call this, not copy it. */
++ * #8's TAW_EPS_MODE=c3 and #6's shared NAMO gate must call this, not copy it. */
+```
 
-**Exact fix (canonical-header patch required):**
-1. In this worktree's `tests/fitgolden.h`, define once (before the helper
-   definitions):
-   ```c
-   #if defined(__GNUC__) || defined(__clang__)
-   #define TAW_TEST_UNUSED __attribute__((unused))
-   #else
-   #define TAW_TEST_UNUSED
-   #endif
-   ```
-   and annotate all seven static helpers (`fgold_env_scrub`, `fit_source`,
-   `fgold_fit`, `fit_probe`, `fit_roundtrip`, `fit_check_ex`, `fit_check`),
-   exactly as #15's header does.
-2. Verify `cc ... -Werror ... tests/test_fitgolden.c` now returns 0 and
-   `ctest` is still green.
-3. Re-copy that patched header to **all nine** fitgolden-carrying PR branches
-   in one coordinated commit (otherwise eight copies diverge again).
-4. Delete #15's private header variant; drop #13's two
-   `-Wno-unused-function` lines from `tests/CMakeLists.txt`.
-5. Keep the prohibition comment — an env var must never turn goldens into
-   no-ops.
+**D2 — canonical calibrated-mix section is stale vs final #10.**
+`docs/design.md` (canonical) says "there is no predictor enum or `-p` token
+yet" and files profile 6 under "pending allocation". Final `8906f3b` adds
+`TAW_PREDICTOR_CALIBRATED=6` and `-p cal` (`tools/taw.c:35,153`,
+`taw.h`), and its format registry allocates value 6 under ruling R-4. Fix
+the canonical text to: "Profile 6 is allocated under R-4 as
+`TAW_PREDICTOR_CALIBRATED` (value 6, `-p cal`); `auto`/`mix` still fit profile
+1 only." Update the "Predictor choices pending format allocation" heading
+to cover only the remaining cases.
 
-**RESOLVED in this worktree:** steps 1–2 are applied — the portable
-`TAW_TEST_UNUSED` macro now annotates all seven shared static helpers in the
-canonical `tests/fitgolden.h`. Re-verified:
-`cc -c -std=c2x -O2 -Wall -Wextra -Wpedantic -Werror ... test_fitgolden.c`
-returns **rc=0** (was rc=1). The `fgold` layout, six-row base table,
-`base_golden` alias and `fgold_env_scrub()` are byte-for-byte unchanged.
-Steps 3–5 remain per-PR batch actions: re-copy the patched header to all nine
-carrying branches, drop #15's private variant, and drop #13's two
-`-Wno-unused-function` lines.
+**D3 — canonical predictor-allocation note is stale vs final #11/#13.**
+Final #11/#13 also implement R-4: predictor values 11 (`TAW_PREDICTOR_GATE`)
+and 14 (`TAW_PREDICTOR_HNET`) are allocated, with `-p gate`/`-p hnet` in their
+own `--help` and token tables. Canonical `docs/design.md` still says "ids are
+therefore **pending allocation** ... neither flag is accepted yet". Fix to
+"allocated under R-4; the `-p` tokens ship with the respective PRs" while
+keeping the "default `auto`/`mix` byte-identical" guarantee.
 
-### F2 — BLOCKER: duplicate `taw_test(fit_opt)` between #5 and #6
+**D4 — #15's CLI/API knobs missing from the canonical registry.**
+`af4e989` adds `-D` (dynamic blocks), `-T N` (target bytes), `-C N` (change
+threshold), a `-B` help line, public `taw_params` fields `dyn_blocks`,
+`chunk_target`, `change_threshold`, and `taw_info.has_dyn_blocks`. They are
+documented in #15's own `--help`/`docs/format.md` §7.2 but are **absent from
+canonical `KNOBS.md` §1.A, `docs/design.md` and `README.md`**. Add to
+`KNOBS.md` §1.A:
 
-Both final branches add the identical `tests/test_fit_opt.c` (blob
-`2115d6b7…`, the shared Newton–Schulz bit-exactness oracle) **and** the same
-`taw_test(fit_opt)` line. Merging batches 2 and 4 without resolution produces
-`add_executable(test_fit_opt …): another target with the same name already
-exists`, plus a duplicate `add_test(NAME fit_opt …`.
+```
+| `-D` | encoder flag | #15 | off | help ✓ (PR branch) | none | default fixed blocks, byte-identical |
+| `-T N` | encoder flag | #15 | `-B` value | help ✓ (PR branch) | none | dynamic-block target |
+| `-C N` | encoder flag | #15 | `0` (ratio) | help ✓ (PR branch) | none | change spike threshold 0..256 |
+```
 
-**Exact fix:** keep one owner. Let #5 land `taw_test(fit_opt)` and
-`test_fit_opt.c` in batch 2. At #6's batch, drop its `taw_test(fit_opt)` line
-and its copy of the file (the blobs are identical, so this is a clean removal,
-not a semantic loss). #6's own `taw_test(namo)` and `cli_fit_namo_seek` stay.
-No other cross-branch target or CLI test name repeats; the nine CLI fit names
-(`cli_fit_golden`, `cli_fit_faro_seek`, `cli_faro_gpu_guard`,
-`cli_fit_namo_seek`, `cli_fit_c3`, `cli_fit_mix_seek`, `cli_fit_gate_seek`,
-`cli_fit_hnet_seek`, `cli_fit_ema_seek`) are all distinct.
+and a short canonical design-doc line: "`.awseek` dynamic blocks are opt-in
+via `-D` (`-T`/`-C` tune them); the default archive is byte-identical to
+fixed blocks and `taw i` reports `dynamic:`."
 
-### F3 — RESOLVED: COMPAT.md's brittle count expired at the first arm merge
+**D5 — #21 appendix wording stale after R-4.**
+`fb0d51f` `analyze.py:470-474` calls `TAW_PREDICTOR_GATE=11` and
+`TAW_PREDICTOR_HNET=14` "pending predictor slots". They are allocated in the
+final PRs. Fix the generated line to "predictor ids allocated under R-4
+(recorded here as historical binary tags)", keeping the surrounding
+"canonical names are `TAW_EPS_SIGN_BETA` / `TAW_EPS_GATE_P` /
+`TAW_EPS_GATE_MODE`; FARO routing has no equivalent" text, which is correct.
 
-`13/13` was correct for the canonical branch alone; after all nine batches the
-suite is **33 tests** (12 original + `fitgolden` + 9 arm targets + `fit_opt` +
-`hnet` + 9 CLI fit tests), gpu skipped. All three numeric occurrences in
-COMPAT.md were replaced with the durable condition "base suite green;
-per-arm targets added by each PR must also pass", so the document no longer
-expires at the first batch. No code or golden value changed.
+**Minor (not blockers) — harness-only env vars.** `TAW_DATA` (#8
+`sweep_eps.sh:8`), `TAW` and `TAW_BENCH_DATA` (#19 bench scripts) and `BENCH_*`
+(#21) are configurable path variables in committed harnesses, not product
+knobs; add one "harness env" note to `KNOBS.md` §1.E if the strict registry is
+to cover them. This does not affect archive bytes or the public API.
 
-## Closing conditional
+## Ruling
 
-If F1 is not applied, then a `-DTADAMW_WERROR=ON` build of every arm that uses
-only part of the canonical header fails, and maintainers will keep forking the
-header to work around it — **F1 is applied and verified (rc=0)**. If F2 is not
-applied, then batches 2 and 4 cannot both be green — **F2 remains open**. If F3
-is ignored, then the golden corpus still passes but the document lies about
-the test count — **F3 is resolved**. Until F2 is closed: **NOT GREEN**.
+Five exact drift items (D1-D5), one of them (D1) a live source comment that
+still names a dead knob. The historical appendix usage for #21, the
+byte-identical defaults and both GPU guards all pass. Fix D1-D5, then this
+pass can be rerun as a clean one.
