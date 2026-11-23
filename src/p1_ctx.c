@@ -143,10 +143,15 @@ taw_status p1_ctx_init(p1_ctx *c, const p1_shape *s)
 	c->avx2 = p1_isa_current() >= P1_ISA_AVX2;
 	c->ncm = s->chunk && s->all ? P1_NCM_ALL : P1_NCM;
 	c->nhash = c->ncm - 2;
+	c->p2 = s->chunk;
 	c->routes = p2_shape_routes(s);
 	c->picks = s->chunk && !s->all;
-	for (unsigned k = 0; k < P1_NHASH; k++)
+	for (unsigned k = 0; k < P1_NHASH; k++) {
 		c->lane[k] = s->lane[k];
+		c->pick_a[k] = s->lane[k] & 7;
+		c->pick_b[k] = s->lane[k] & 7;
+		c->pick_s[k] = s->lane[k] < 8 ? 0 : -1;
+	}
 	if (c->routes)
 		c->route = s->route;
 	c->lines_log2 = s->lines_log2;
@@ -190,18 +195,18 @@ void p1_ctx_free(p1_ctx *c)
 static void byte_hashes_for(const p1_ctx *c, uint32_t c4, uint32_t c8,
     uint32_t word, const p2_chunk *ch, uint32_t *g)
 {
+#if TAW_X86_SIMD
+	if (c->avx2 && !c->p2) {
+		p1_byte_hashes_avx2(c4, c8, word, g);
+		return;
+	}
+#endif
 	uint32_t ab[8] = {0};
 	if (c->routes)
 		p2_chunk_args(ch, ab);
 #if TAW_X86_SIMD
 	if (c->avx2) {
-		if (c->picks) {
-			alignas(32) uint32_t all[16];
-			p1_byte_hashes_avx2(c4, c8, word, ab, all);
-			p2_pick_lanes_avx2(all, c->lane, g);
-		} else {
-			p1_byte_hashes_avx2(c4, c8, word, ab, g);
-		}
+		p2_byte_hashes_avx2(c, c4, c8, word, ab, g);
 		return;
 	}
 #endif
@@ -219,7 +224,7 @@ static void byte_hashes_for(const p1_ctx *c, uint32_t c4, uint32_t c8,
 	for (unsigned j = 0; j < 4; j++)
 		all[P2_CX_PREV + j] = p1_hash3(ab[2 * j], ab[2 * j + 1], 15 + j);
 	for (unsigned k = 0; k < c->nhash; k++)
-		g[k] = all[c->picks ? (unsigned)c->lane[k] : k];
+		g[k] = all[c->picks ? c->lane[k] : k];
 }
 
 /* hh[k] = H(g[k], q, 0): the line hash for a nibble (q = 0 at bit 0, the
@@ -242,7 +247,7 @@ static void line_hashes(const p1_ctx *c, const uint32_t *g, uint32_t q,
 static void lines_apply(p1_ctx *c, const uint32_t *hh)
 {
 #if TAW_X86_SIMD
-	if (c->avx2) {
+	if (c->avx2 && c->nhash == P1_NHASH) {
 		p1_lines_apply_avx2(c, hh);
 		return;
 	}
@@ -265,7 +270,7 @@ static void lines_apply(p1_ctx *c, const uint32_t *hh)
 static inline void lines_prefetch(const p1_ctx *c, const uint32_t *hh)
 {
 #if TAW_X86_SIMD
-	if (c->avx2) {
+	if (c->avx2 && c->nhash == P1_NHASH) {
 		p1_lines_prefetch_avx2(c, hh);
 		return;
 	}

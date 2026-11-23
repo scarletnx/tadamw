@@ -231,17 +231,11 @@ typedef struct {
 	alignas(32) uint32_t si[16];  /* arena index of each model's slot */
 	alignas(32) uint32_t lb[16];  /* arena index of each hashed model's line */
 	uint32_t c0, bitpos, nib, c4, c8, word, pos;
-	p2_chunk ch;                   /* profile 2: the chunk stage */
-	uint32_t line[2][P2_LINE_MAX]; /* its closed chunks, by line */
 	uint32_t mptr, mlen, msi;
 	int mexp;   /* expected byte, or -1 */
 	int mbit;   /* expected bit for the current bit, or -1 */
 	bool avx2;  /* use the AVX2 context kernels */
-	bool routes; /* profile 2 with the chunk stage running */
-	bool picks;  /* profile 2: hashed lane k runs context lane[k] */
 	/* geometry */
-	unsigned ncm, nhash; /* context models (P1_NCM, or P1_NCM_ALL in the
-	                        encoder's feature pass); the hashed ones */
 	unsigned lines_log2;
 	uint32_t hist_mask, match_mask;
 	/* tables; slots are stored XOR P1_SLOT_INIT so that zero = initial */
@@ -257,13 +251,26 @@ typedef struct {
 	alignas(32) uint32_t spec_g[2][16];  /* byte hashes after the byte */
 	alignas(32) uint32_t spec_hh[2][16]; /* line hashes at the boundary */
 	uint32_t spec_mi[2];                 /* match-table index */
-	p2_chunk spec_ch[2];                 /* chunk state after the byte */
-	alignas(32) int32_t lane[16];        /* context id per hashed lane */
-	p2_route route;
 	/* Line tags are (hash & 0xFFFF) | epoch << 16; a reset starts a new
 	 * epoch instead of clearing the hashed tables. */
 	uint32_t epoch;
 	bool fresh; /* the arena is still all zero */
+	/* What profile 2 and the encoder's feature pass add comes after
+	 * everything above, whose places the per-bit loop was measured
+	 * with: moving them cost profile 1 up to 5% of its decoding speed. */
+	unsigned ncm, nhash; /* context models (P1_NCM, or P1_NCM_ALL in the
+	                        encoder's feature pass); the hashed ones */
+	bool p2;     /* profile 2 (a decoder, or the feature pass) */
+	bool routes; /* profile 2 with the chunk stage running */
+	bool picks;  /* profile 2: hashed lane k runs context lane[k] */
+	p2_chunk ch;                   /* the chunk stage */
+	p2_chunk spec_ch[2];           /* its state after the byte, both ways */
+	/* lane k of the picked hashes is lane pick_a[k] of the first eight
+	 * candidates, or lane pick_b[k] of the others where pick_s[k] is set */
+	alignas(32) int32_t pick_a[16], pick_b[16], pick_s[16];
+	uint8_t lane[P1_NHASH];        /* context id per hashed lane */
+	p2_route route;
+	uint32_t line[2][P2_LINE_MAX]; /* closed chunks, by line */
 } p1_ctx;
 enum { P1_EPOCH_MAX = 0x7FFF };
 
@@ -283,16 +290,19 @@ void p1_ctx_update(p1_ctx *c, int bit);
  * to the scalar code in p1_ctx.c. */
 void p1_cm_inputs_avx2(p1_ctx *c, float *x);
 void p1_cm_update_avx2(p1_ctx *c, int bit);
-/* Byte hashes g[0..9] from the history, and g[10..13] = H(ab[2j],
- * ab[2j + 1], 15 + j) for profile 2's chunk contexts; line hashes
- * hh = H(g, q, 0). g and hh are 16 aligned lanes. */
+/* Byte hashes g[0..9] from the history; line hashes hh = H(g, q, 0).
+ * g and hh are 16 aligned lanes. */
 void p1_byte_hashes_avx2(uint32_t c4, uint32_t c8, uint32_t word,
-    const uint32_t ab[8], uint32_t *g);
-/* out[k] = g[lane[k]] for 16 lanes. */
-void p2_pick_lanes_avx2(const uint32_t *g, const int32_t *lane,
-    uint32_t *out);
+    uint32_t *g);
+/* Profile 2: the byte hashes of all fourteen candidates (g[10..13] =
+ * H(ab[2j], ab[2j + 1], 15 + j) for the chunk contexts), or, when c picks
+ * lanes, of the context in each of its ten lanes. */
+void p2_byte_hashes_avx2(const p1_ctx *c, uint32_t c4, uint32_t c8,
+    uint32_t word, const uint32_t ab[8], uint32_t *g);
 void p1_line_hashes_avx2(const uint32_t *g, uint32_t q, uint32_t *hh);
-/* Line selection for hh (tag check, reset on mismatch) and prefetch. */
+/* Line selection for hh (tag check, reset on mismatch) and prefetch, for
+ * the 10 hashed models of a decoder (the encoder's 16-model feature pass
+ * uses the scalar ones). */
 void p1_lines_apply_avx2(p1_ctx *c, const uint32_t *hh);
 void p1_lines_prefetch_avx2(const p1_ctx *c, const uint32_t *hh);
 /* Arena index of the first hashed table (after O0 and O1). */

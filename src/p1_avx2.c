@@ -204,11 +204,37 @@ static inline __m256i hash8(__m256i a, __m256i b, __m256i kk)
 	return _mm256_xor_si256(x, _mm256_srli_epi32(x, 15));
 }
 
-/* Byte hashes g_k of profile 1's 10 hashed models and, in lanes 10..13,
- * of profile 2's four chunk contexts with the arguments ab (lanes 14, 15
- * are padding). The lanes are built in registers from the scalars. */
+/* Byte hashes g_k of the 10 hashed models (lanes 10..15 padding). The
+ * lanes are built in registers from the scalars: no argument arrays. */
 void p1_byte_hashes_avx2(uint32_t c4, uint32_t c8, uint32_t word,
-    const uint32_t ab[8], uint32_t *g)
+    uint32_t *g)
+{
+	const int C4 = (int)c4;
+	__m256i a0 = _mm256_setr_epi32(C4 & 0xFFFF, C4 & 0xFFFFFF, C4, C4,
+	    (int)((c4 >> 8) & 0xFFFF), (int)word, (int)(c4 & 0xFFFF0000u),
+	    (int)(c4 & 0xFF00FF00u));
+	__m256i b0 = _mm256_setr_epi32(0, 0, 0, (int)(c8 & 0xFFFF), 0,
+	    C4 & 0xFF, 0, 0);
+	__m256i a1 = _mm256_setr_epi32((int)(c4 & 0xFF0000FFu), C4 & 0xFFFF,
+	    0, 0, 0, 0, 0, 0);
+	__m256i b1 = _mm256_setr_epi32(0, (int)(c8 & 0xFFFF0000u), 0, 0, 0, 0,
+	    0, 0);
+#define KK(k) ((int)((uint32_t)(k) * 0xC2B2AE3Du))
+	__m256i k0 = _mm256_setr_epi32(KK(2), KK(3), KK(4), KK(6), KK(8), KK(9),
+	    KK(11), KK(12));
+	__m256i k1 = _mm256_setr_epi32(KK(13), KK(14), 0, 0, 0, 0, 0, 0);
+#undef KK
+	_mm256_store_si256((__m256i *)g, hash8(a0, b0, k0));
+	_mm256_store_si256((__m256i *)(g + 8), hash8(a1, b1, k1));
+}
+
+/* Profile 2: the hashes of all fourteen candidates (profile 1's ten as
+ * above, the four chunk contexts with the arguments ab in lanes 10..13),
+ * then, for a decoder shape, moved to the lanes its model names. The move
+ * stays in registers: a gather from a just stored array would wait for
+ * the store. */
+void p2_byte_hashes_avx2(const p1_ctx *c, uint32_t c4, uint32_t c8,
+    uint32_t word, const uint32_t ab[8], uint32_t *g)
 {
 	const int C4 = (int)c4;
 	__m256i a0 = _mm256_setr_epi32(C4 & 0xFFFF, C4 & 0xFFFFFF, C4, C4,
@@ -226,18 +252,20 @@ void p1_byte_hashes_avx2(uint32_t c4, uint32_t c8, uint32_t word,
 	__m256i k1 = _mm256_setr_epi32(KK(13), KK(14), KK(15), KK(16), KK(17),
 	    KK(18), 0, 0);
 #undef KK
-	_mm256_store_si256((__m256i *)g, hash8(a0, b0, k0));
-	_mm256_store_si256((__m256i *)(g + 8), hash8(a1, b1, k1));
-}
-
-/* out[k] = g[lane[k]]: the contexts a profile 2 model put in each lane. */
-void p2_pick_lanes_avx2(const uint32_t *g, const int32_t *lane,
-    uint32_t *out)
-{
-	_mm256_store_si256((__m256i *)out, _mm256_i32gather_epi32(
-	    (const int *)g, _mm256_load_si256((const __m256i *)lane), 4));
-	_mm256_store_si256((__m256i *)(out + 8), _mm256_i32gather_epi32(
-	    (const int *)g, _mm256_load_si256((const __m256i *)(lane + 8)), 4));
+	const __m256i g0 = hash8(a0, b0, k0), g1 = hash8(a1, b1, k1);
+	if (!c->picks) {
+		_mm256_store_si256((__m256i *)g, g0);
+		_mm256_store_si256((__m256i *)(g + 8), g1);
+		return;
+	}
+	for (unsigned h = 0; h < 16; h += 8) {
+		const __m256i a = _mm256_permutevar8x32_epi32(g0,
+		    _mm256_load_si256((const __m256i *)(c->pick_a + h)));
+		const __m256i b = _mm256_permutevar8x32_epi32(g1,
+		    _mm256_load_si256((const __m256i *)(c->pick_b + h)));
+		_mm256_store_si256((__m256i *)(g + h), _mm256_blendv_epi8(a, b,
+		    _mm256_load_si256((const __m256i *)(c->pick_s + h))));
+	}
 }
 
 /* hh[k] = H(g[k], q, 0) for 16 lanes. */
@@ -250,29 +278,23 @@ void p1_line_hashes_avx2(const uint32_t *g, uint32_t q, uint32_t *hh)
 	    hash8(_mm256_load_si256((const __m256i *)(g + 8)), qv, z));
 }
 
-/* Lanes 8..15 that hold a hashed model: 2 of them with 10 hashed models,
- * 6 with the encoder's 14. */
-alignas(32) static const int32_t lanes_hi[2][8] = {
-	{-1, -1, 0, 0, 0, 0, 0, 0}, {-1, -1, -1, -1, -1, -1, 0, 0}};
-
-/* Arena line index per hashed model k (lanes 0..nhash-1; the rest point
- * at line 0 of the arena, which is never a hashed line, and are masked
- * out). */
+/* Arena line index per hashed model k (lanes 0..9; 10..15 point at line
+ * 0 of the arena, which is never a hashed line, and are masked out). */
 static inline void line_bases(const p1_ctx *c, const uint32_t *hh,
     __m256i *lb0, __m256i *lb1)
 {
 	const __m128i sh = _mm_cvtsi32_si128((int)(32 - c->lines_log2));
 	const __m128i lg = _mm_cvtsi32_si128((int)c->lines_log2);
 	const __m256i k0 = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-	const __m256i k1 = _mm256_setr_epi32(8, 9, 10, 11, 12, 13, 0, 0);
+	const __m256i k1 = _mm256_setr_epi32(8, 9, 0, 0, 0, 0, 0, 0);
 	const __m256i hx = _mm256_set1_epi32(P1_ARENA_HX);
 	__m256i a = _mm256_add_epi32(_mm256_sll_epi32(k0, lg), _mm256_srl_epi32(
 	    _mm256_load_si256((const __m256i *)hh), sh));
 	__m256i b = _mm256_add_epi32(_mm256_sll_epi32(k1, lg), _mm256_srl_epi32(
 	    _mm256_load_si256((const __m256i *)(hh + 8)), sh));
 	*lb0 = _mm256_add_epi32(hx, _mm256_slli_epi32(a, 4));
-	*lb1 = _mm256_and_si256(_mm256_add_epi32(hx, _mm256_slli_epi32(b, 4)),
-	    _mm256_load_si256((const __m256i *)lanes_hi[c->nhash > P1_NHASH]));
+	*lb1 = _mm256_blend_epi32(_mm256_setzero_si256(),
+	    _mm256_add_epi32(hx, _mm256_slli_epi32(b, 4)), 0x03);
 }
 
 void p1_lines_apply_avx2(p1_ctx *c, const uint32_t *hh)
@@ -292,17 +314,14 @@ void p1_lines_apply_avx2(p1_ctx *c, const uint32_t *hh)
 	    _mm256_cmpeq_epi32(g0, t0))) |
 	    (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(
 	    _mm256_cmpeq_epi32(g1, t1))) << 8;
-	miss = ~miss & ((1u << c->nhash) - 1);
-	/* lb[P1_CM_O2 + k]: lanes 0..nhash-1 of lb0:lb1, moved up by two
-	 * (the masked lanes are 0, so the padding of c->lb stays 0). */
+	miss = ~miss & 0x3FFu;
+	/* lb[P1_CM_O2 + k]: lanes 0..9 of lb0:lb1, moved up by two. */
 	alignas(32) uint32_t lb[16], tg[16];
 	_mm256_store_si256((__m256i *)lb, lb0);
 	_mm256_store_si256((__m256i *)(lb + 8), lb1);
 	_mm256_storeu_si256((__m256i *)(c->lb + P1_CM_O2), lb0);
-	_mm_storeu_si128((__m128i *)(c->lb + P1_CM_O2 + 8),
-	    _mm256_castsi256_si128(lb1));
-	c->lb[P1_CM_O2 + 12] = lb[12];
-	c->lb[P1_CM_O2 + 13] = lb[13];
+	c->lb[P1_CM_O2 + 8] = lb[8];
+	c->lb[P1_CM_O2 + 9] = lb[9];
 	if (miss) {
 		_mm256_store_si256((__m256i *)tg, t0);
 		_mm256_store_si256((__m256i *)(tg + 8), t1);
@@ -325,6 +344,6 @@ void p1_lines_prefetch_avx2(const p1_ctx *c, const uint32_t *hh)
 	alignas(32) uint32_t lb[16];
 	_mm256_store_si256((__m256i *)lb, lb0);
 	_mm256_store_si256((__m256i *)(lb + 8), lb1);
-	for (unsigned k = 0; k < c->nhash; k++)
+	for (unsigned k = 0; k < P1_NHASH; k++)
 		_mm_prefetch((const char *)(c->arena + lb[k]), _MM_HINT_T0);
 }
