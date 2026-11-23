@@ -272,6 +272,12 @@ experiment is not part of this surface. **Byte identity:** every FARO knob is
 inert until `TAW_FARO=on`; with it unset the shipped update expressions run
 verbatim.
 
+**GPU guard:** FARO-ERC lives in the CPU fitter only (the Vulkan trainer has
+no risk/ERC hooks). With `TAW_FARO=on` and `-g on` or `-g auto`, fitting is
+forced onto the CPU (`TAW_GPU_OFF`) so the archive cannot depend on the
+machine's Vulkan device. Unlike the C3 guard below, this is a silent
+downgrade, not an error.
+
 ### NAMO / NAMO-D
 
 | variable | default | effect |
@@ -285,9 +291,11 @@ verbatim.
 | `TAW_NAMO_NEST` | `0` | Nesterov momentum for the NAMO W1 update |
 
 `TAW_MALT`/`TAW_MALTER` take precedence over `TAW_HYBRID`; leave them unset
-when selecting a NAMO mode. Sign gating has one owner, `TAW_EPS_MODE=c3`
-below — there is no NAMO-specific gate setting. The shared `TAW_MUON_NEST`
-keeps its shipped default of `1`; NAMO has its own `TAW_NAMO_NEST`.
+when selecting a NAMO mode. `TAW_NAMO_NEST` is the NAMO-only Nesterov switch
+(default `0`, the paper's un-extrapolated momentum); the shared
+`TAW_MUON_NEST` keeps its shipped default of `1` in every mode, so no shared
+knob changes meaning under NAMO. Sign gating has one owner, `TAW_EPS_MODE=c3`
+below; NAMO exposes no private gate knob.
 **Byte identity:** all of the above are inert at the default
 `TAW_HYBRID=adam`.
 
@@ -307,7 +315,6 @@ identity:** with `TAW_LR1` unset (or numeric) the archive is unchanged.
 | `TAW_EPS_GATE_MODE=mean\|shrink` | `mean` | mean-preserving or shrink-only gate |
 | `TAW_EPS_LAYERS=1\|2\|12` | `2` | layer bitmask (1 = AdamW path, 2 = layer 2) |
 | `TAW_EPS_SCOPE=all\|cold\|warm` | `all` | touch-count stratification |
-| `TAW_EPS_GRAN=row\|set` | `row` | per-weight or per-set granularity |
 | `TAW_EPS_DEBUG` | unset | print per-layer gating statistics to stderr |
 
 This is the single owner of the sign gate; it wraps only AdamW `(m, v)`
@@ -315,11 +322,17 @@ vector updates and leaves the Muon and MALT/MALTER W1 paths untouched.
 **Byte identity:** with `TAW_EPS_MODE` unset (or `none`) every update is the
 shipped one.
 
+**GPU guard:** the gate is implemented in the CPU fitter only.
+`TAW_EPS_MODE=c3` with `-g on` or `-g auto` is rejected with `TAW_E_ARG`
+("invalid argument") rather than silently training GPU candidates with plain
+AdamW. Set `-g off` when using the gate.
+
 ### Model averaging
 
-`TAW_FIT_AVG=off|late|swa|ema9|ema95|ema99|ema999|swa_all` (default `off`)
-folds averaged weights into the fitted model. `late` is EMA(0.999) only for
-runs of at least six epochs (levels 3+); levels 1-2 keep the last iterate.
+`TAW_FIT_AVG=off|late|swa|ema9|ema95|ema99|ema999|swa_all` (default `off`;
+numeric aliases `0..7` and `ema09` are also accepted) folds averaged weights
+into the fitted model. `late` is EMA(0.999) only for runs of at least six
+epochs (levels 3+); levels 1-2 keep the last iterate.
 **Byte identity:** the default is `off`, so with the variable unset every
 archive — including MALTER/Muon runs — is identical to the shipped one.
 `late` is opt-in via the environment only, and GPU warm-start nets are not
@@ -337,6 +350,40 @@ flag is accepted yet. When an id is allocated, the format spec, loader
 validation, golden vectors, CLI round-trip test, `--help` line and README
 usage line must land together. Until then the default `auto`/`mix` path is
 byte-identical.
+
+### Calibrated mixer (profile 6, pending allocation)
+
+`TAW_CALIBRATED=0|1|on|cal` (default `0`, i.e. off; `1`, `on` and `cal` enable)
+opts the fitter into profile 6 (`CALIBRATED_MIX`), which stores eight bytes of
+fitted temperature/bias/weight parameters in the archive. As with profiles 11
+and 14, profile 6 is **pending format and CLI allocation**: there is no
+predictor enum or `-p` token yet, and `auto`/`mix` always fit profile 1 only.
+The test suite also reads `TAW_CAL_PARAMS=temp,bias,w0,w1,w2` and
+`TAW_CAL_NO_APM=1` as ablation overrides (encoder-only, unset by default);
+they are not product knobs. Profile 6 candidates fit on the CPU even with
+`-g on`/`-g auto`, to keep the held-out-sample path.
+**Byte identity:** with `TAW_CALIBRATED` unset (or `0`) every archive is the
+shipped profile-1 result.
+
+### Historical names (provenance only — not valid in current code)
+
+These tokens appear in the archived benchmark matrix (`exp/final-matrix`) and
+in earlier experiment reports. They are **not accepted by current code**;
+they exist here only to explain historical env strings. Do not copy them into
+new commands or docs.
+
+| archived token | status / current equivalent |
+|----------------|-----------------------------|
+| `TAW_SIGN_BETA` | renamed → `TAW_EPS_SIGN_BETA` |
+| `TAW_GATE_P` | renamed → `TAW_EPS_GATE_P` |
+| `TAW_GATE_MODE` | renamed → `TAW_EPS_GATE_MODE` (code rename still pending) |
+| `TAW_FARO_ROUTE` | rejected routing lane; no equivalent — FARO-ERC has no route knob |
+| `TAW_FIT_LRSCALE` | removed knob; use `TAW_LR0` / `TAW_LR1` |
+
+`TAW_FIT_LRSCALE` was removed from #19's pre-fix `bench/control.sh` and is
+cited in that PR's results; it is not present in the staged #21 tree. The
+other four tokens do occur in #21's archived env strings, where they identify
+pre-rename binaries from unmerged branches.
 
 ## GPU fitting
 

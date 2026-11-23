@@ -1,107 +1,66 @@
-# INTEGRATION.md — canonical fitgolden harness, implemented
+# INTEGRATION.md — final knob-doc integration
 
-Branch `integration/golden-canonical` (from `foundation/golden-harness` @
-`bd32f43`). Local only; no fetch, no corpora touched, no push.
+Branch `integration/knob-final`, based on `foundation/knob-docs` @ `4f5cb9b`
+(which contains `KNOBS.md` @ `b080612`, the docs patch @ `694f862`, and
+`RECONCILE.md` @ `4f5cb9b`). Local only; nothing pushed.
 
-If a decoder from main reads this archive, then the archive must still be
-main's — and if a golden test is meant to prove it, there must be exactly one
-copy of the test and one copy of the baseline table. This branch implements
-that single copy.
+## 1. Doc changes applied to `docs/design.md`
 
-## 1. What is now in the tree
+| item | change |
+|------|--------|
+| `TAW_EPS_GATE_MODE` | kept as the canonical documented name (already in the "Epsilon / sign gate" table); the old `TAW_GATE_MODE` appears only in the historical appendix |
+| `TAW_EPS_GRAN` | **removed** from the live table — the knob was deleted with C2 in staged #8 |
+| GPU guards | FARO: `TAW_FARO=on` + `-g on\|auto` silently forces CPU (`TAW_GPU_OFF`). C3: `TAW_EPS_MODE=c3` + `-g on\|auto` is rejected with `TAW_E_ARG`. Both documented, with the asymmetry called out |
+| NAMO | live section now documents `TAW_NAMO_NEST` (default `0`) as the NAMO-only switch; the drift text about a NAMO gate alias and a conditional `TAW_MUON_NEST` was removed |
+| `TAW_FIT_AVG` | numeric aliases `0..7` and `ema09` documented as retained |
+| `TAW_CALIBRATED` | new "Calibrated mixer (profile 6, pending allocation)" subsection: default `0`/off, `1`/`on`/`cal` enable, CPU-only, test-only `TAW_CAL_PARAMS`/`TAW_CAL_NO_APM`, byte-identical default |
+| historical appendix | new "Historical names (provenance only)" subsection listing `TAW_SIGN_BETA`, `TAW_GATE_P`, `TAW_GATE_MODE`, `TAW_FARO_ROUTE`, `TAW_FIT_LRSCALE` with current equivalents/status |
 
-| File | Status |
-|---|---|
-| `tests/fitgolden.h` | **the only** copy. Fixed `fgold` layout, `fgold_opts`/`fit_check_ex`, `fit_probe`/`fit_roundtrip`/`fit_source`, `fitgolden_base[]` (6 rows) + `FITGOLDEN_BASE_N`, `fgold_env_scrub()`, `base_golden` alias. No `TAW_GOLDEN_PRINT`. |
-| `tests/test_fitgolden.c` | **the only** copy. One `main()`: `fgold_env_scrub(); fit_check("base", fitgolden_base, FITGOLDEN_BASE_N);`. |
-| `tests/CMakeLists.txt` | **one** `taw_test(fitgolden)` (line 21, unchanged from `d08f019`). No other fitgolden target. |
-| `tests/golden_corpus.sh` | unchanged; still the 12 external SHA/size pairs from COMPAT.md. |
+## 2. Verification (no live phantom references)
 
-Public API of the canonical header (signatures are the contract for staged
-arms):
+`grep -E 'TAW_NAMO_GATE|TAW_GATE_MODE|TAW_EPS_GRAN|TAW_SIGN_BETA|TAW_GATE_P|TAW_FARO_ROUTE|TAW_FIT_LRSCALE' docs/design.md`
+returns matches only at lines 377-383 — i.e. **only inside the historical
+appendix**. `README.md` has none. Live knob tables use only canonical names:
+`TAW_EPS_GATE_MODE`, `TAW_NAMO_NEST`, `TAW_CALIBRATED`, plus the existing
+FARO/EMA entries.
 
-```c
-typedef struct { int level; taw_weights w; size_t arc_n;
-                 uint64_t model_size; uint32_t model_crc; } fgold;
-typedef struct { taw_predictor pred; uint8_t profile; } fgold_opts;
-static void fgold_env_scrub(void);                 /* unset every TAW_* */
-static void fit_probe(int, taw_weights, fgold *, void **, size_t *);
-static void fit_roundtrip(const void *, size_t);
-static void fit_check_ex(const char *, const fgold *, size_t,
-                         const fgold_opts *);
-static void fit_check(const char *, const fgold *, size_t); /* MIX wrapper */
-static const fgold fitgolden_base[];               /* 6 rows */
-#define FITGOLDEN_BASE_N ...
-#define base_golden fitgolden_base                 /* #6 alias */
-```
+Two clarifications on the verification wording:
 
-The six baseline rows are the four council/e cells plus #19's two L3 cells:
-`L3/F16 261701/568/0x1388A8EA`, `L3/Q8 263030/1888/0x1A6E3799` (re-measured
-on main during round 2, both matched).
+- `TAW_NAMO_NEST` is documented live as the **target** name. It does not yet
+  exist in staged #6 (`e40b8c0`), which still uses a conditional default on
+  `TAW_MUON_NEST`. This is an intentional "docs lead, code follows" state;
+  the required code fix is listed in §3. The drift names (`TAW_NAMO_GATE*` and
+  conditional `TAW_MUON_NEST`) are absent from the live doc.
+- `KNOBS.md` and `RECONCILE.md` intentionally retain old tokens — they are a
+  registry and an audit record, not live user docs. Their references are
+  provenance and must not be "cleaned up" into silence.
+- `TAW_FIT_LRSCALE` is not present in the staged #21 tree; it was removed from
+  #19's pre-fix `bench/control.sh` and is cited in that PR's results. It is
+  listed in the appendix because the integration brief names it, with its
+  provenance stated explicitly in the appendix text.
 
-**Alias compatibility verified by compile check in this branch:** the staged
-`test_namo.c` (uses `base_golden`), `test_ema.c` (uses `fit_probe`,
-`fit_roundtrip`, `fitgolden_base`, `FITGOLDEN_BASE_N`), `test_faro_fit.c` and
-`test_lr`'s table all compile unchanged with `-fsyntax-only` against this
-header. Their private copies can simply be deleted at merge; only the env
-scrub call needs adding to each `main()` where it is not already present.
+No `--help`, CLI token tables, predictor enums or source files were changed:
+profile ids 6/11/14 remain pending allocation in `docs/format.md` §2 (only 0
+and 1 are implemented).
 
-## 2. Unique per-PR arm files and targets
+## 3. Code-side renames still required
 
-Each arm file includes **this** header, contains **only** its own arm tables,
-calls `fgold_env_scrub()` first, and has its own unique CTest target. None
-defines a baseline table, a helper, or `main()` for `fitgolden`.
+| PR | staged SHA | required code/doc work | why the doc is currently ahead of code |
+|----|-----------|------------------------|----------------------------------------|
+| **#6 NAMO** | `e40b8c0` | In `src/fit.c`: add `TAW_NAMO_NEST` (default `0`) and use it at line 817 in place of `fit_env_uint("TAW_MUON_NEST", is_namo ? 0 : 1)`; delete `TAW_NAMO_GATE`, `TAW_NAMO_GATE_BETA`, `TAW_NAMO_GATE_P` (lines 811-814) and the NAMO `shrink` field; update `RESULTS.md` knob table (lines 342-344), tests and bench strings | Live doc promises a NAMO-only NEST switch and no private gate; staged code has neither |
+| **#8 EPS gate** | `af5fd00` | Rename `TAW_GATE_MODE` → `TAW_EPS_GATE_MODE` in `src/fit.c:525`, the README table added by the fix, `RESULTS.md` examples (lines 209, 389) and any tests; optionally make `eps_requested()` accept only `c3` (today `c2`/`nc9` warn but still enable); rename or document test-only `TAW_GOLDEN_PRINT` | Live doc uses the canonical renamed name; staged code/PR README still use the old one |
+| **#21 final matrix** | `0b9b8d8` | Annotate historical env strings in `bench_one.sh:19,45`, `analyze.py:124,129` and `RESULTS.md:38,43` with a "pre-rename historical binary" footnote (do not silently rewrite them — that would break reproduction); fix the stale `bench_one.sh:13-14` comment claiming #19 defaults to `TAW_AVG_LATE`; keep `FITPIN='TAW_FIT_AVG=off'` | The archived matrix legitimately records pre-rename tokens, but must not read as current API guidance |
 
-| PR | Arm file | CTest target | Tables / code to move from the PR | CMake line to add at that batch |
-|---|---|---|---|---|
-| #5 faro | `tests/test_faro_fit.c` | `faro_fit` | `erc`, `erc_muon`, `malter`, `malter_erc`; drop `base[]` | `taw_test(faro_fit)` |
-| #6 namo | `tests/test_namo.c` | `namo` | `namo`, `namod`, `namo_gate`, `namod_row`, `namo_nest`; drop header's `base_golden[]` (alias only) | `taw_test(namo)` |
-| #7 lr-baseline | `tests/test_tuned_lr.c` (**new**) | `tuned_lr` | `tuned[]` (LR/WD); drop duplicate `shipped[]` and the private `fitgolden.h` | `taw_test(tuned_lr)` |
-| #8 eps-gate | `tests/test_c3_fit.c` | `c3_fit` | `SHRINK`, `SHRINK_PLAIN`, `MEAN`, `MEAN_PLAIN`, `LAYERS1`, `SCOPE_COLD`, `BETA95`, `GATE_P2`, `gate_direct()`, distinctness CHECKs; drop `BASELINE[]` and the `TAW_GOLDEN_PRINT` early-out | `taw_test(c3_fit)` |
-| #10 calibration | `tests/test_cal_fit.c` | `cal_fit` | `cal`, `ident`, `calonly`, `apmonly`; drop `base[]`; replace `fit_check(..., bool cal)` with `fit_check_ex(..., &(fgold_opts){.profile = 6})` | `taw_test(cal_fit)` |
-| #11 entropygate | `tests/test_gate_fit.c` (**new**) | `gate_fit` | `gate[]` rewritten 6-field → 5-field + `&(fgold_opts){.pred = TAW_PREDICTOR_GATE, .profile = 11}`; drop inlined helper and `base[]` | `taw_test(gate_fit)` |
-| #13 hnet-feature | `tests/test_hnet_fit.c` | `hnet_fit` | `hnet[]` rewritten with `&(fgold_opts){.pred = TAW_PREDICTOR_HNET, .profile = 14}`; drop `base[]` | `taw_test(hnet_fit)` (+ keep distinct `taw_test(hnet)` profile unit test) |
-| #15 hnet-blocks | `tests/test_dynfit.c` | `dynfit` | `dfgold` table; rename local `static fit_check` → `dyn_fit_check` (container golden, not a fitter golden) | `taw_test(dynfit)` |
-| #19 ema | `tests/test_ema.c` | `ema` | `ema999_gold`, `swa_gold`, `ema9_gold`, `late_gold`, `malt_ab()`; drop header's `fitgolden_base[]` | `taw_test(ema)` |
+Existing `RECONCILE.md` §§1.3, 2.2, 3.2, 4.2 contain the verbatim replacement
+text for the #6, #8 and #21 documentation edits; this file records the
+integration state, not a duplicate patch.
 
-CLI fit scripts stay distinct and are registered under the already-unique
-names `cli_fit_c3`, `cli_fit_mix_seek`, `cli_fit_gate_seek`,
-`cli_fit_hnet_seek`, `cli_fit_faro_seek`.
+## 4. Follow-ups (non-blocking)
 
-**Why the arm files are specified here but not registered on main:** their
-knobs and predictor enum values do not exist in `1aa3dd7`. A registered arm on
-main would either fail to compile or (if made conditional) skip silently —
-both are false greens, which is precisely the failure mode this harness
-exists to prevent. The files are created/registered at the batch that merges
-the corresponding PR, using the exact names above. The final inventory after
-all nine batches is 28 CTest names, none repeated.
-
-## 3. Migration rule for each staged PR
-
-At merge time, for every PR in the table:
-
-1. Delete its `tests/fitgolden.h` and `tests/test_fitgolden.c` (if present).
-2. Delete its `taw_test(fitgolden)` line; keep only the arm target line.
-3. Replace arm tables' `pred` field with `fgold_opts` passed to
-   `fit_check_ex()`; for #10 replace `bool cal` with `.profile = 6`.
-4. Call `fgold_env_scrub()` at the start of each arm `main()` **before**
-   setting arm knobs; this supersedes the incomplete per-PR knob lists.
-5. Never reintroduce an env var that suppresses assertions.
-
-`tests/CMakeLists.txt` conflicts in every batch; resolve by keeping the
-foundation `taw_test(fitgolden)` block and appending only that batch's arm
-line. Acceptance after each batch: build clean, `ctest` green, and
-`grep -c 'taw_test(fitgolden)' tests/CMakeLists.txt` == 1.
-
-## 4. Verification performed on this branch
-
-- `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTADAMW_GPU=OFF` +
-  `cmake --build build -j4` — clean.
-- `./build/tests/test_fitgolden` — pass with all six baseline rows.
-- Four staged arm tests compile unchanged against the canonical header
-  (NAMO, EMA, FARO, LR-baseline), confirming the aliases.
-- `ctest` — full suite green (gpu skipped). Count is still **13/13**: no new
-  target was registered on main, so COMPAT.md's `13/13` needs no further edit
-  in this round.
-- `tests/golden_corpus.sh` — expected to remain `golden corpus set OK (12
-  pairs)`; the encoder was not touched.
+- `TAW_GOLDEN_PRINT` (#8, `tests/fitgolden.h:47`) is a test-only diagnostic
+  that violates the `_DEBUG` diagnostic convention; rename to
+  `TAW_TEST_GOLDEN_PRINT` or add it to the diagnostic doc line.
+- Decide the `namo-d` alias in #6 (currently accepted at `fit.c:773`): keep and
+  document, or drop to one canonical token `namod`.
+- `TAW` (binary path) in #19's harness scripts is a very generic env name;
+  prefer `TAW_BENCH_BIN` if the harness is kept long-term.
