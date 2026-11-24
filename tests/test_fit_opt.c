@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Foundation refactor: bit-exactness of the shared Newton-Schulz polynomial.
+/* Bit-exactness of the shared Newton-Schulz polynomial.
  *
- * The `ref_*` functions below are VERBATIM copies of main's inline loops
- * (fit.c @ 1aa3dd7). They are the oracle: run the ref and the new wrappers on
- * identical inputs and compare the raw float bytes. This catches any change
- * in coefficient, accumulation order, transpose map or normalization. */
+ * The `ref_*` functions below are reference copies of the inline loops. They
+ * are the oracle: run the ref and the wrappers on identical inputs and
+ * compare the raw float bytes. This catches any change in coefficient,
+ * accumulation order, transpose map or normalization. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +13,7 @@
 #include "fit_opt.h"
 #include "taw_internal.h"
 
-/* ---- oracle: main's original loops, copied verbatim ------------------------- */
+/* ---- oracle: reference loops ------------------------------------------------ */
 
 static void ref_ns(float *x, float *a, float *b, float *y,
     size_t mr, size_t mc, unsigned steps)
@@ -350,8 +350,8 @@ static const profile_desc profiles[] = {
 	{"malter", HYB_MALTER, true,  0.055f, 1e-3f, 1.0f},
 };
 
-/* Golden CRCs recorded from the oracle (verbatim main) over the raw float
- * bytes of the full trajectory state. Filled from the reference run below;
+/* Golden CRCs recorded from the oracle over the raw float bytes of the full
+ * trajectory state. Filled from the reference run below;
  * any change to the shipped arithmetic breaks these. */
 static const uint32_t profile_golden[] = {
 	0x963B6289u, /* adam   */
@@ -475,8 +475,8 @@ static float tg_gate(void *ctx, size_t k, float gk)
 	return t->mul[k];
 }
 
-/* Oracle: staged #8's adam_rows_gated math, written out locally so the test
- * does not depend on a second copy living in fit.c. */
+/* Oracle: the gated AdamW math, written out locally so the test does not
+ * depend on a second copy living in fit.c. */
 static void ref_gated_adam(optcfg *o, float *w, float *m, float *v,
     const float *g, size_t len, float scale, float lr, float wd, float mix,
     float *sig, float beta, float p, bool mean_pres)
@@ -509,7 +509,7 @@ static bool gate_near(float a, float b)
 
 static void hooks_abi(void)
 {
-	/* The gate's direct numbers are #8's unit test (af5fd00). */
+	/* Direct numbers for the gate's sign EMA. */
 	float s = 0.0f;
 	CHECK(gate_near(fit_gate_step(&s, 1.0f, 0.9f, 1.0f), 0.1f));
 	CHECK(gate_near(fit_gate_step(&s, 1.0f, 0.9f, 1.0f), 0.19f));

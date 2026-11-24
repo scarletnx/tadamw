@@ -16,29 +16,29 @@ Two variants share one header and one model section:
 | `.aw`     | 0    | stream: chunks are decoded strictly in order |
 | `.awseek` | 1    | seekable: independent fixed-size blocks + seek index |
 
-## Allocation registry (central ledger)
+## Allocation registry
 
-This is the single source of truth for arithmetic-profile IDs and awseek flag
-bits. Section numbers follow the rule *section number = profile ID*; profiles
-0 and 1 are grandfathered at §2.1/§2.2 and §5.1.
+This table is the authority for arithmetic-profile IDs and awseek flag bits.
+Section numbers follow the rule *section number = profile ID*; profiles
+0 and 1 are fixed at §2.1/§2.2 and §5.1.
 
-| id / bit | name | owner | canonical section(s) | status on this base |
-|----------|------|-------|----------------------|---------------------|
-| profile 0 | `INT_ORDER0` | upstream | §2.1, §5 (intro note) | implemented |
-| profile 1 | `F32_STRICT_MIX` | upstream | §2.2, §5.1 | implemented, golden-pinned |
-| profile 6 | `CALIBRATED_MIX` | PR #10 | §2.6, §5.6 | allocated, subject to ratification; refuse here |
-| profile 11 | `ENTROPY_GATE` | PR #11 | §2.11, §5.11 | allocated, subject to ratification; refuse here |
-| profile 14 | `HNET_BOUNDARY` | PR #13 | §2.14, §5.14 | allocated, subject to ratification; refuse here |
-| awseek flag bit 1 | variable-length blocks (container only) | PR #15 | §7.2 | allocated, subject to ratification; refuse here |
-| profile 3, 7 | `SOFT_GATED`, `SOFT_GATED_CAL` | PR #12 | — | denied: spec/code mismatch, default-path regression, gain lost under Muon |
-| profile 8 | `PAQ_MIX` | PR #18 | — | held; probationary reservation only, no allocation |
-| profile 10 | `F32_CHAINED_MIX` | PR #17 | — | denied: negative result (3 of 4 cells worse) |
-| profile 12 | `MDL_TREE` | PR #16 | — | denied: default-path change, L1-only; encoder-only knob instead |
+| id / bit | name | canonical section(s) | status on this base |
+|----------|------|----------------------|---------------------|
+| profile 0 | `INT_ORDER0` | §2.1, §5 (intro note) | implemented |
+| profile 1 | `F32_STRICT_MIX` | §2.2, §5.1 | implemented, golden-pinned |
+| profile 6 | `CALIBRATED_MIX` | §2.6, §5.6 | reserved; decoder refuses |
+| profile 11 | `ENTROPY_GATE` | §2.11, §5.11 | reserved; decoder refuses |
+| profile 14 | `HNET_BOUNDARY` | §2.14, §5.14 | reserved; decoder refuses |
+| awseek flag bit 1 | variable-length blocks (container only) | §7.2 | reserved; decoder refuses |
+| profile 3, 7 | `SOFT_GATED`, `SOFT_GATED_CAL` | — | reserved; decoder refuses |
+| profile 8 | `PAQ_MIX` | — | reserved; decoder refuses |
+| profile 10 | `F32_CHAINED_MIX` | — | reserved; decoder refuses |
+| profile 12 | `MDL_TREE` | — | reserved; decoder refuses |
 
-Denied and held IDs are reserved: decoders MUST refuse them. No quant ID is
-added here: quant ids `5..11` (`Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4`,
-`IQ2`) stay exactly as specified in §3, and every retained profile uses the
-profile-1 quant set. §2.3 and §5.2 are sealed (see below).
+Reserved IDs are refused by decoders. No quant ID is added here: quant ids
+`5..11` (`Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4`, `IQ2`) stay exactly as
+specified in §3, and every retained profile uses the profile-1 quant set.
+§2.3 and §5.2 are sealed (see below).
 
 ### Predictor enum (`taw_predictor`, API only)
 
@@ -49,19 +49,18 @@ remains the sole authority for profile IDs.
 
 | value | enum name | profile | status |
 |-------|-----------|---------|--------|
-| 0 | `TAW_PREDICTOR_AUTO` | — | grandfathered |
-| 1 | `TAW_PREDICTOR_ORDER0` | 0 | grandfathered (legacy value) |
-| 2 | `TAW_PREDICTOR_MIX` | 1 | grandfathered (legacy value) |
-| 6 | `TAW_PREDICTOR_CALIBRATED` | 6 | allocated (PR #10) |
-| 11 | `TAW_PREDICTOR_GATE` | 11 | allocated (PR #11) |
-| 14 | `TAW_PREDICTOR_HNET` | 14 | allocated (PR #13) |
+| 0 | `TAW_PREDICTOR_AUTO` | — | original value |
+| 1 | `TAW_PREDICTOR_ORDER0` | 0 | legacy value |
+| 2 | `TAW_PREDICTOR_MIX` | 1 | legacy value |
+| 6 | `TAW_PREDICTOR_CALIBRATED` | 6 | allocated |
+| 11 | `TAW_PREDICTOR_GATE` | 11 | allocated |
+| 14 | `TAW_PREDICTOR_HNET` | 14 | allocated |
 
 Values `3..5`, `7..10`, `12..13` and `15..255` are refused:
 `taw_params_resolve()` returns `TAW_E_ARG` and the CLI offers no name for
 them. Value 11 is the only allocated value in the nominal `7..13` range,
-because predictor values equal their profile IDs. Value 3 is **void**: it is
-not allocated. No predictor value is assigned to the denied or held profile
-IDs 3, 7, 8, 10 or 12.
+because predictor values equal their profile IDs. Value 3 is **void**. No
+predictor value is assigned to the reserved profile IDs 3, 7, 8, 10 or 12.
 
 ## 1. File header (32 bytes)
 
@@ -102,16 +101,15 @@ identical probabilities for every bit.
 |----|-----------------|---------------|--------|
 | 0  | `INT_ORDER0`    | empty (`model_size = 0`, `quant = 0`) | implemented, placeholder |
 | 1  | `F32_STRICT_MIX`| mixer shape and weights, §5.1; quant `F16`, `Q8`, `Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4` or `IQ2` | implemented |
-| 6  | `CALIBRATED_MIX` (PR #10) | §5.6 (allocated placeholder, not normative here) | allocated; refuse until ratified |
-| 11 | `ENTROPY_GATE` (PR #11) | §5.11 (allocated placeholder, not normative here) | allocated; refuse until ratified |
-| 14 | `HNET_BOUNDARY` (PR #13) | §5.14 (allocated placeholder, not normative here) | allocated; refuse until ratified |
-| 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 15..255 | — | — | unknown, denied or held: refuse |
+| 6  | `CALIBRATED_MIX` | §5.6 | reserved; decoder refuses |
+| 11 | `ENTROPY_GATE` | §5.11 | reserved; decoder refuses |
+| 14 | `HNET_BOUNDARY` | §5.14 | reserved; decoder refuses |
+| 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 15..255 | — | — | reserved: refuse |
 
-This is the only profile table. IDs `6`, `11` and `14` are allocated to named
-PRs and are therefore **not** inside the reserved range; their normative text
-is not on this base, so a decoder here still refuses them. IDs `3`, `7`, `8`,
-`10` and `12` are denied or held (see the allocation registry) and MUST NOT be
-reclaimed as free. §2.3 and §5.2 are sealed.
+This is the only profile table. IDs `6`, `11` and `14` are named in the
+allocation registry but are not implemented on this base, so a decoder here
+refuses them. IDs `3`, `7`, `8`, `10` and `12` are reserved (see the allocation
+registry) and MUST NOT be treated as free. §2.3 and §5.2 are sealed.
 
 ### 2.1 Profile 0: `INT_ORDER0`
 
@@ -597,7 +595,7 @@ the entries are followed by the file directory (§7.1), still inside the index
 and covered by `index_crc`.
 
 The 16-byte entry above is the normative version-1 layout. A 20-byte entry
-adding `u32 raw_len` behind awseek flag bit 1 (§7.2) is a proposed extension,
+adding `u32 raw_len` behind awseek flag bit 1 (§7.2) is a reserved extension,
 not part of this document: a decoder on this base MUST refuse flag bit 1
 rather than parse such an index.
 

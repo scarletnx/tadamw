@@ -263,7 +263,7 @@ guarantee.
 |----------|---------|--------|
 | `TAW_FARO` | `off` | `1`/`on`/`yes`/`true` enables FARO routing and ERC; unset/`0`/`off` is bit-exact base |
 | `TAW_FARO_ROUTE` | `ret` | W1 geometry: `ret` (measured return), `muon`, `adam` |
-| `TAW_FARO_STAT` | `probe` | `probe` (one-step counterfactual bits) or `lin` (linearized score via the shared NS polynomial) |
+| `TAW_FARO_STAT` | `probe` | `probe` (one-step counterfactual bits) or `lin` (linearized score with the shared NS polynomial) |
 | `TAW_FARO_EXPLORE` | `20` | post-untie batches used to measure returns before the route freezes |
 | `TAW_FARO_ALLOC` | `erc` | `none` disables reallocation (multiplier 1) |
 | `TAW_FARO_BLOCKS=set\|layer` | `set` | risk-block granularity |
@@ -342,7 +342,7 @@ into the fitted model. `late` is EMA(0.999) only for runs of at least six
 epochs (levels 3+); levels 1-2 keep the last iterate.
 **Byte identity:** the default is `off`, so with the variable unset every
 archive — including MALTER/Muon runs — is identical to the shipped one.
-`late` is opt-in via the environment only, and GPU warm-start nets are not
+`late` is opt-in through the environment only, and GPU warm-start nets are not
 averaged.
 
 ### Predictor choices: gate and hnet
@@ -357,7 +357,7 @@ stays byte-identical.
 
 ### Calibrated mixer (profile 6)
 
-`TAW_CALIBRATED=0|1|on|cal` (default `0`, i.e. off; `1`, `on` and `cal` enable)
+`TAW_CALIBRATED=0|1|on|cal` (default `0`, that is, off; `1`, `on` and `cal` enable)
 opts the fitter into profile 6 (`CALIBRATED_MIX`), which stores eight bytes of
 fitted temperature/bias/weight parameters in the archive. Predictor value 6
 is `TAW_PREDICTOR_CALIBRATED` with the `-p cal` CLI token; `auto`/`mix` still
@@ -514,7 +514,7 @@ blocks), whole blocks are decoded straight into the caller's buffer and
 the partial ones at the edges through a per-thread buffer. The source's
 `read_at` must then be thread safe (`pread` is).
 
-`.awseek` dynamic blocks are opt-in via `-D` (`-T` sets the target block
+`.awseek` dynamic blocks are opt-in through `-D` (`-T` sets the target block
 bytes and `-C` the change spike threshold, 0 = ratio mode); the default
 archive is byte-identical to fixed blocks and `taw i` reports `dynamic:`.
 The matching public API fields are `taw_params.dyn_blocks`,

@@ -477,9 +477,7 @@ static const char *fit_env_str(const char *name, const char *def)
  *
  * The paper's counterfactual uses a disjoint held-out probe shard and follows
  * the full training trajectory; here the probe is in-batch, one step long, and
- * only W1 has a second candidate geometry. See RESULTS.md: this approximation
- * does not recover the hand-designed Muon route, so the ERC lane is the part
- * that is validated here.
+ * only W1 has a second candidate geometry.
  */
 typedef struct {
 	bool on, route_ret, alloc, frozen, debug;

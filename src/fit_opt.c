@@ -11,8 +11,8 @@ static inline float inv_root8(float x)
 	return 1.0f / fsqrt(fsqrt(fsqrt(x)));
 }
 
-/* The single sign-consistency gate, verbatim from staged #8 (af5fd00). Both
- * #8's TAW_EPS_MODE=c3 and #6's TAW_NAMO_GATE=c3 must call this, not copy it. */
+/* The single sign-consistency gate. Both TAW_EPS_MODE=c3 and TAW_NAMO_GATE=c3
+ * call this rather than copying the math. */
 float fit_gate_step(float *sig, float gk, float beta, float p)
 {
 	const float sg = gk > 0.0f ? 1.0f : gk < 0.0f ? -1.0f : 0.0f;
@@ -39,7 +39,7 @@ void adam_rows(optcfg *o, float *w, float *m, float *v, const float *g,
 		v[k] = o->b2 * v[k] + (1.0f - o->b2) * gk * gk;
 		float mh = m[k] * c1, vh = v[k] * c2;
 		if (gated) {
-			/* #8's rounding order: shape upd first, then apply lr. */
+			/* Rounding order: shape upd first, then apply lr. */
 			float upd = mh / (fsqrt(vh) + o->eps) + wd * w[k];
 			upd *= h->shape.gate(h->shape.ctx, k, gk);
 			w[k] -= mix * lr * upd;
@@ -203,9 +203,9 @@ void malt_rows(const optcfg *o, float *w, float *m, float *l, float *r,
 	}
 }
 
-/* FARO's TAW_FARO_STAT=lin linearized return. Upstream's copy repeated the
- * NS loop; here it shares ns_ortho(), so the polynomial has one home. The
- * normalization/contraction order is unchanged (verified byte-identical). */
+/* FARO's TAW_FARO_STAT=lin linearized return. It shares ns_ortho() so the
+ * Newton-Schulz polynomial has one home; the normalization/contraction order
+ * is unchanged. */
 float ns_score(const optcfg *o, const float *g, unsigned rows, unsigned cols)
 {
 	float x[NS_MAXEL], a[NS_MAXEL], b[NS_MAXEL], y[NS_MAXEL];

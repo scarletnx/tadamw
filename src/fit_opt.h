@@ -128,10 +128,10 @@ typedef struct {
 } optcfg;
 
 /* ---- dispatch / hook ABI -----------------------------------------------------
- * ONE ABI for all fitting-side features. The foundation defines the slots and
- * leaves them NULL on shipped paths; PR #5/#6/#8/#19 supply implementations
- * instead of editing optimizer branches. tnet is opaque here: its definition
- * stays in fit_internal.h (shared with the GPU trainer).
+ * ONE ABI for all fitting-side features. The base defines the slots and
+ * leaves them NULL on shipped paths; optional fitting hooks are supplied by
+ * encoder-side knobs instead of editing optimizer branches. tnet is opaque
+ * here: its definition stays in fit_internal.h (shared with the GPU trainer).
  */
 
 struct tnet;
@@ -150,11 +150,11 @@ typedef struct {
 	unsigned bid;         /* FARO risk block, 0 when the bank is off */
 } opt_plan;
 
-/* The single step-shaping slot: C3 sign gate (#8) and NAMO_GATE (#6) are
+/* The single step-shaping slot: the sign gate and the NAMO gate are
  * configuration aliases into this, never two implementations. begin() is the
  * first pass (advance sign EMA, fill the per-weight multiplier bank, apply
  * mean-preserving normalization); gate() is the second pass (read multiplier
- * k). eps() is reserved for C2, which staged #8 dropped; NULL when unused. */
+ * k). eps() is a reserved coordinate-epsilon hook; NULL when unused. */
 typedef struct {
 	void  *ctx;
 	void  (*begin)(void *ctx, const float *g, size_t len, float scale);
@@ -177,10 +177,9 @@ typedef struct {
 	void (*finalize) (void *ctx, struct tnet *);
 } opt_hooks;
 
-/* The one sign-consistency gate math, adopted verbatim from staged #8
- * (exp-eps-gate @ af5fd00, fit.c:544-550). sig is the sign EMA of the raw
- * gradient gk; the returned multiplier is |sig|^p (p = 1 or 2). Tests use
- * this directly (0.1 / 0.19 / 0.01 for beta = 0.9). */
+/* The sign-consistency gate math: sig is the sign EMA of the raw gradient
+ * gk; the returned multiplier is |sig|^p (p = 1 or 2). Tests use this
+ * directly (0.1 / 0.19 / 0.01 for beta = 0.9). */
 float fit_gate_step(float *sig, float gk, float beta, float p);
 
 /* ---- thin wrappers (fit_opt.c) ---------------------------------------------- */
