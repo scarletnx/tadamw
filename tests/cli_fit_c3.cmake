@@ -44,7 +44,7 @@ run("${TAW}" c -l 1 -p mix -B 4096 "${INPUT}" "${WORK}/c3.awseek")
 run("${TAW}" d "${WORK}/c3.awseek" "${WORK}/c3seek.out")
 same("${INPUT}" "${WORK}/c3seek.out")
 
-# GPU guard (I7): require the guard's OWN diagnostic, not just any failure —
+# GPU guard: require the guard's OWN diagnostic, not just any failure —
 # a GPU-less CI would otherwise pass vacuously on "no Vulkan device".
 execute_process(COMMAND "${TAW}" c -l 1 -p mix -g on "${INPUT}" "${WORK}/no.aw"
                 RESULT_VARIABLE rc ERROR_VARIABLE err)
@@ -56,7 +56,7 @@ else()
   message(FATAL_ERROR "guard did not fire (rc=${rc}): ${err}")
 endif()
 
-# I5: c2/nc9/junk are errors, not implicit gate enables.
+# c2/nc9/junk are errors, not implicit gate enables.
 foreach(bad c2 nc9 nonsense)
   execute_process(COMMAND ${CMAKE_COMMAND} -E env "TAW_EPS_MODE=${bad}"
                   "${TAW}" c -l 1 -p mix "${INPUT}" "${WORK}/bad_${bad}.aw"

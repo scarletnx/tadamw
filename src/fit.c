@@ -1032,7 +1032,7 @@ static float namo_gate_at(void *v, size_t k, float gk)
 	return c->mul[k];
 }
 
-/* ---- C3 sign-consistency gate (PR #8, opt-in, CPU only) ------------------------
+/* ---- C3 sign-consistency gate (opt-in, CPU only) ------------------------------
  * The gate arithmetic itself belongs to the foundation: fit_gate_step() in
  * fit_opt.c is the single implementation. Here we only parse knobs and wire
  * the foundation's step_shape slot into the AdamW vector updates. Muon/MALT/
@@ -1057,19 +1057,17 @@ static bool eps_mode_off(const char *m)
 }
 
 /* Only the literal "c3" enables the gate; c2/nc9/junk are errors, never an
- * implicit enable (I5). */
+ * implicit enable. */
 static bool eps_mode_enabled(void)
 {
 	const char *m = getenv("TAW_EPS_MODE");
 	return m && !strcmp(m, "c3");
 }
 
-/* Coalescing arbitration: #6 requires every TAW_NAMO_* knob (including the
- * shared TAW_EPS_MODE gate) to be inert off-NAMO, while #8 deliberately
- * enables the gate on plain AdamW. Both published CRC sets are preserved by
- * giving the NAMO leak guard precedence whenever NAMO-only knobs are set and
- * the NAMO geometry is not selected. Pure #8 configurations have no NAMO
- * knobs and keep the gate. */
+/* NAMO-only knobs (including the shared TAW_EPS_MODE gate) are inert off-NAMO,
+ * while the C3 gate is enabled on plain AdamW. The NAMO leak guard takes
+ * precedence whenever NAMO-only knobs are set but NAMO geometry is not
+ * selected; configurations with no NAMO knobs keep the gate. */
 static bool namo_knobs_present(void)
 {
 	static const char *const names[] = {"TAW_NAMO_BETA", "TAW_NAMO_SCALE",
@@ -1258,7 +1256,7 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 	/* LR endpoints. Plain AdamW defaults to the shipped schedule; each
 	 * other component has its own knob so the two LRs can be tuned apart. */
 	const float lr0 = fit_env_float("TAW_LR0", 0.02f);
-	/* PR #7 convenience: TAW_LR1=flat keeps LR constant at TAW_LR0. */
+	/* TAW_LR1=flat keeps LR constant at TAW_LR0. */
 	const char *lr1s = getenv("TAW_LR1");
 	float lr1 = fit_env_float("TAW_LR1", lr0 / 20.0f);
 	if (lr1s && strcmp(lr1s, "flat") == 0)
@@ -1289,7 +1287,7 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 	/* NAMO has its own NEST switch (default 0: the paper's M_t direction). */
 	if (is_namo)
 		o.nesterov = fit_env_uint("TAW_NAMO_NEST", 0) != 0;
-	/* Shared gate (I4): TAW_EPS_MODE=c3, with the #8 beta/p knobs. It is
+	/* Shared gate: TAW_EPS_MODE=c3, with the beta/p knobs. It is
 	 * wired only into the NAMO hook, never into AdamW/Muon/MALTER. */
 	if (is_namo && !strcmp(fit_env_str("TAW_EPS_MODE", "none"), "c3")) {
 		ng.sig = t->sig;
@@ -2010,7 +2008,7 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 {
 	*out = (taw_model_choice){.profile = TAW_PROFILE_INT_ORDER0,
 		.quant = TAW_QUANT_NONE};
-	/* I5: c2/nc9/junk are errors, never an implicit gate enable. */
+	/* c2/nc9/junk are errors, never an implicit gate enable. */
 	taw_status es = eps_mode_validate();
 	if (es != TAW_OK)
 		return es;

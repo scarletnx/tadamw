@@ -237,14 +237,14 @@ float ns_score(const optcfg *o, const float *g, unsigned rows, unsigned cols)
 }
 /* NAMO / NAMO-D (arXiv:2602.17080v2, Algorithms 1 and 2) on a row-major
  * rows x cols W1 matrix. The first moment m[] is the usual Muon momentum
- * (m = mu1*m + g, with g already divided by the batch size), i.e. the paper's
+ * (m = mu1*m + g, with g already divided by the batch size), that is, the paper's
  * biased M_t / (1-mu1). Orthogonalization is scale invariant, so O_t is the
  * paper's Orth(M_t) up to that constant; the bias-corrected scale mu1^t and
  * eps_t are folded into the adaptive scale below. NAMO uses one scalar
  * alpha_t; NAMO-D uses column norms and a clamped right-diagonal D_t. The
  * adaptive scale also multiplies decoupled weight decay, as in the paper's
- * GPT-2 experiments. Ported verbatim from exp-namo @ e40b8c0: the gate now
- * comes from the shared step_shape hook and `(h,bid)` replaces `sig`. */
+ * GPT-2 experiments. The gate comes from the shared step_shape hook, and
+ * `(h,bid)` replaces `sig`. */
 void namo_rows(const optcfg *o, float *w, float *m, const float *g,
     float *vs, float *vc, size_t set, size_t rows, size_t cols, float scale,
     float lr, float wd, bool diag, const opt_hooks *h, unsigned bid)
