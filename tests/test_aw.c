@@ -168,6 +168,17 @@ int main(void)
 	CHECK(taw_compress(&one, 1, &bad, &o, &on) == TAW_E_ARG);
 	bad = (taw_params){.predictor = (taw_predictor)7};
 	CHECK(taw_compress(&one, 1, &bad, &o, &on) == TAW_E_ARG);
+	/* R-4 status policy: void value 3 is a bad argument; the allocated
+	 * predictors 6/11/14 belong to profiles not implemented here, so they
+	 * are unsupported (as on #11/#13). */
+	bad = (taw_params){.predictor = (taw_predictor)3};
+	CHECK(taw_compress(&one, 1, &bad, &o, &on) == TAW_E_ARG);
+	bad = (taw_params){.predictor = TAW_PREDICTOR_CALIBRATED};
+	CHECK(taw_compress(&one, 1, &bad, &o, &on) == TAW_E_UNSUPPORTED);
+	bad = (taw_params){.predictor = TAW_PREDICTOR_GATE};
+	CHECK(taw_compress(&one, 1, &bad, &o, &on) == TAW_E_UNSUPPORTED);
+	bad = (taw_params){.predictor = TAW_PREDICTOR_HNET};
+	CHECK(taw_compress(&one, 1, &bad, &o, &on) == TAW_E_UNSUPPORTED);
 	bad = (taw_params){.weights = (taw_weights)(TAW_WEIGHTS_IQ2 + 1)};
 	CHECK(taw_compress(&one, 1, &bad, &o, &on) == TAW_E_ARG);
 	/* Too small for any model inside the n/32 budget. */

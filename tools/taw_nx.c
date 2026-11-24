@@ -543,6 +543,16 @@ static int cmd_encode(int argc, char **argv)
 		    !(v & (v - 1))) {
 			p.block_size = (uint32_t)(v << 20);
 			i++;
+		} else if (!strcmp(argv[i], "-D")) {
+			p.dyn_blocks = true;
+		} else if (!strcmp(argv[i], "-T") && i + 1 < argc &&
+		    parse_u64(argv[i + 1], &v) && v >= 1 && v <= (1u << 26)) {
+			p.chunk_target = (uint32_t)v;
+			i++;
+		} else if (!strcmp(argv[i], "-C") && i + 1 < argc &&
+		    parse_u64(argv[i + 1], &v) && v <= 256) {
+			p.change_threshold = (uint32_t)v;
+			i++;
 		} else if (!strcmp(argv[i], "-k") && i + 1 < argc) {
 			keys = argv[++i];
 		} else if (!strcmp(argv[i], "-q")) {
@@ -958,8 +968,8 @@ static void usage(FILE *f)
 {
 	fprintf(f,
 #if TAW_HAVE_ENCODER
-	    "usage: taw-nx enc [-l level] [-j threads] [-B block_MiB] [-k prod.keys] [-q]\n"
-	    "                  <in.xci|in.nsp> <out.awseek>\n"
+	    "usage: taw-nx enc [-l level] [-j threads] [-B block_MiB] [-D [-T target] [-C change]]\n"
+	    "                  [-k prod.keys] [-q] <in.xci|in.nsp> <out.awseek>\n"
 #endif
 #if TAW_HAVE_DECODER
 	    "       taw-nx dec [-j threads] [-k prod.keys] [-q] <in.awseek> <out.xci|out.nsp>\n"
@@ -968,6 +978,7 @@ static void usage(FILE *f)
 	    "  enc  decrypt every NCA (and an XCI's gamecard info) that encrypts back\n"
 	    "       exactly, and store the dump as a .awseek with two files: the dump\n"
 	    "       and " META_NAME ". Level 1..9 (default 1), blocks default 64 MiB,\n"
+	    "       -D enables content-aligned variable blocks (default: fixed).\n"
 	    "       threads default one per CPU. A temporary <out>.plain the size of\n"
 	    "       the dump is written next to the output.\n"
 	    "  dec  expand, encrypt again, and check the SHA-256: the result is the\n"

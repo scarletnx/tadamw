@@ -1,9 +1,9 @@
 # tar_aw container format, version 1
 
-Status: draft. Normative for everything implemented (profiles 0 and 1);
-reserved values are listed so that decoders can refuse them.
-`tests/test_p1.c` pins profile 1 with golden vectors: a change that breaks
-them changes the format.
+Status: draft. Normative for everything implemented (profiles 0 and 1, and
+the awseek variable-length-block container extension in §7.2); reserved values
+are listed so that decoders can refuse them. `tests/test_p1.c` pins profile 1
+with golden vectors: a change that breaks them changes the format.
 
 All integers are unsigned and little-endian unless stated otherwise.
 `crc32c` is CRC-32C (Castagnoli, reflected polynomial `0x82F63B78`, init
@@ -14,7 +14,7 @@ Two variants share one header and one model section:
 | extension | kind | purpose |
 |-----------|------|---------|
 | `.aw`     | 0    | stream: chunks are decoded strictly in order |
-| `.awseek` | 1    | seekable: independent fixed-size blocks + seek index |
+| `.awseek` | 1    | seekable: independent fixed-size or content-aligned blocks + seek index |
 
 ## Allocation registry
 
@@ -29,7 +29,7 @@ Section numbers follow the rule *section number = profile ID*; profiles
 | profile 6 | `CALIBRATED_MIX` | §2.6, §5.6 | reserved; decoder refuses |
 | profile 11 | `ENTROPY_GATE` | §2.11, §5.11 | reserved; decoder refuses |
 | profile 14 | `HNET_BOUNDARY` | §2.14, §5.14 | reserved; decoder refuses |
-| awseek flag bit 1 | variable-length blocks (container only) | §7.2 | reserved; decoder refuses |
+| awseek flag bit 1 | variable-length blocks (container only) | §7.2 | implemented; off by default |
 | profile 3, 7 | `SOFT_GATED`, `SOFT_GATED_CAL` | — | reserved; decoder refuses |
 | profile 8 | `PAQ_MIX` | — | reserved; decoder refuses |
 | profile 10 | `F32_CHAINED_MIX` | — | reserved; decoder refuses |
@@ -72,7 +72,7 @@ predictor value is assigned to the reserved profile IDs 3, 7, 8, 10 or 12.
 | 6   | 1    | arith_profile  | §2 |
 | 7   | 1    | quant          | §3 |
 | 8   | 1    | level          | encoder effort 1..9, informational |
-| 9   | 1    | flags          | bit 0: the awseek index has a file directory (§7.1); other bits `0` |
+| 9   | 1    | flags          | bit 0: the awseek index has a file directory (§7.1); bit 1: the awseek index uses variable-length blocks (§7.2); other bits `0` |
 | 10  | 2    | reserved       | must be `0` |
 | 12  | 4    | block_size     | awseek: raw bytes per block; aw: `0` |
 | 16  | 8    | model_size     | bytes in the model section |
@@ -80,15 +80,15 @@ predictor value is assigned to the reserved profile IDs 3, 7, 8, 10 or 12.
 | 28  | 4    | header_crc     | crc32c of bytes 0..27 |
 
 A decoder MUST refuse a file if any of these hold: wrong magic, unknown
-version or kind, a flag bit other than bit 0 (or bit 0 on an aw stream),
-non-zero reserved bytes, bad `header_crc` or
+version or kind, a flag bit other than 0 or 1 (or either flag bit on an aw
+stream), non-zero reserved bytes, bad `header_crc` or
 `model_crc`, or an unsupported `(arith_profile, quant)` pair. Decoders never
 fall back to a different arithmetic: an archive decodes exactly or not at all.
 
-For awseek, `block_size` MUST be a power of two in `[2^12, 2^30]`.
-
-Flag bit 1 is reserved for the container-only extension in §7.2; a decoder on
-this base refuses it as an unsupported flag.
+For awseek, `block_size` MUST be a power of two in `[2^12, 2^30]`. With flag
+bit 1 set it is the *nominal* block size used for fitting and for length
+bounds; actual block lengths are carried in the index (§7.2). A default
+archive (flag bit 1 clear) is byte-identical to the fixed-block layout.
 
 ## 2. Arithmetic profiles
 
@@ -588,16 +588,17 @@ Index:
 | 4    | magic `54 41 57 49` ("TAWI") |
 | 4    | block_count |
 | 8    | total_raw_len |
-| 16 × block_count | entries: `u64 coded_offset` (absolute), `u32 coded_len`, `u32 raw_crc` |
+| 16 × block_count¹ | entries: `u64 coded_offset` (absolute), `u32 coded_len`, `u32 raw_crc` |
 
-`block_count` MUST equal `ceil(total_raw_len / block_size)`. With flag bit 0
-the entries are followed by the file directory (§7.1), still inside the index
-and covered by `index_crc`.
+¹ With flag bit 1 (§7.2) each entry is **20 bytes** and adds a `u32 raw_len`;
+`block_count` is then the number of entries, not `ceil(total/block_size)`.
+The table above describes the default fixed-block layout.
 
-The 16-byte entry above is the normative version-1 layout. A 20-byte entry
-adding `u32 raw_len` behind awseek flag bit 1 (§7.2) is a reserved extension,
-not part of this document: a decoder on this base MUST refuse flag bit 1
-rather than parse such an index.
+`block_count` MUST equal `ceil(total_raw_len / block_size)` whenever flag bit
+1 (variable-length blocks, §7.2) is clear — including when flag bit 0 is set
+and a file directory follows the entries (§7.1). With flag bit 0 the entries
+are followed by the file directory, still inside the index and covered by
+`index_crc`.
 
 Footer (the last 16 bytes of the file):
 
@@ -631,8 +632,52 @@ Rules (a decoder MUST refuse a directory that breaks one):
 
 Bytes outside every file are allowed but carry no name.
 
-### 7.2 Variable-length blocks
+### 7.2 Variable-length blocks (flag bit 1)
 
-Reserved container-only extension: awseek flag bit 1 and 20-byte index entries
-carrying `raw_len`. It is not normative on this base; the flag remains
-refused and the index remains 16-byte (§7).
+Flag bit 1 is an opt-in container feature. A default archive never sets it and
+is byte-identical to the fixed-block layout above. It changes only the
+container: `.aw` and the profile 0/1 arithmetic, model section and range coder
+are unchanged.
+
+With the flag set, the index entries are 20 bytes instead of 16:
+
+| size | field |
+|------|-------|
+| 8 | `u64 coded_offset` (absolute) |
+| 4 | `u32 coded_len` |
+| 4 | `u32 raw_crc` (crc32c of the decoded block) |
+| 4 | `u32 raw_len` (decoded bytes in this block) |
+
+`block_count` is no longer derived from `block_size`; it is the number of
+entries. A decoder MUST refuse an index whose entry sum is not
+`total_raw_len`, or that has an entry with `raw_len == 0`, `raw_len > 2^26`,
+`coded_len > raw_len`, or an out-of-range `coded_offset`. Block `i` covers raw
+bytes `[sum(raw_len[0..i-1]), sum(raw_len[0..i]))`; the same sums drive random
+access, so a seek reads exactly the blocks overlapping the requested range.
+`coded_len == raw_len` still means stored. `block_size` remains a power of two
+and is the nominal size used for model fitting.
+
+The widened index is covered in full by `index_crc`: the footer's `u32
+index_crc` is CRC-32C over the index bytes from its magic through the last
+entry (and any following file directory, §7.1), including `block_count`,
+`total_raw_len` and every new `raw_len`. The footer itself is **unchanged**:
+the last 16 bytes are still `u64 index_offset`, `u32 index_crc`, and the magic
+`TAWE` as in §7, and they remain outside the CRC. CRCs are checked before any
+flag-dependent field is parsed, and a valid CRC does not make an out-of-range
+`raw_len`, `coded_len` or `coded_offset` legal.
+
+**Encoder boundary rule (deterministic).** A first pass computes, for each byte
+`x` with predecessor `c`, an order-1 surprise
+`256 - (((count[c][x]+1)<<16)/(total[c]+256) >> 8)`, where the saturating
+`uint16_t` counts are updated strictly in input order. Only deviations of that
+surprise from its EWMA (1/256), at least 8 on the 0..256 scale, count as
+*change*. A second pass places a boundary whenever the accumulated change
+reaches an equal share of the total (`total_change / ceil(total/target)`), or
+at a `change_threshold` spike when that knob is set, subject to
+`min_len = target/4` and `max_len = min(4*target, 2^26)`. Both passes read the
+source sequentially, so the archive does not depend on `threads`. `target`
+defaults to `block_size`; the CLI switches are `taw c -D -T N -C N` and
+`taw-nx enc -D -T N -C N`.
+
+A decoder that implements only the fixed-block layout of §7 MUST refuse flag
+bit 1 with `TAW_E_UNSUPPORTED` rather than misreading the index.

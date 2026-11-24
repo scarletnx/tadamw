@@ -144,6 +144,7 @@ taw_status taw_read_info(const void *src, size_t n, taw_info *info)
 	*info = (taw_info){
 		.kind = (taw_kind)h.kind,
 		.has_files = (h.flags & TAW_FLAG_FILES) != 0,
+		.has_dyn_blocks = (h.flags & TAW_FLAG_DYN_BLOCKS) != 0,
 		.arith_profile = h.profile,
 		.quant = h.quant,
 		.level = h.level,

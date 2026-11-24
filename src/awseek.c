@@ -60,6 +60,243 @@ static void files_put(taw_buf *b, const taw_file *f, size_t n)
 	}
 }
 
+/* ---- dynamic block boundaries (docs/format.md §7.2) ------------------------ */
+
+/* The "representation" is the order-1 context of a byte; the dissimilarity
+ * score is its surprise under a saturating (prev,byte) histogram. All state
+ * is carried strictly in input order, so the boundaries are identical for any
+ * thread count and for memory or streaming sources. */
+typedef struct {
+	uint16_t *cnt; /* [256][256], saturating */
+	uint16_t tot[256];
+	uint8_t prev;
+	bool have_prev;
+	uint32_t mean;      /* EWMA of surprise, 8.8 fixed point */
+	unsigned last_dev;  /* deviation of the last byte from mean, floored */
+} change_ctx;
+
+static taw_status change_init(change_ctx *c)
+{
+	c->cnt = calloc(256u * 256u, sizeof *c->cnt);
+	if (!c->cnt)
+		return TAW_E_NOMEM;
+	memset(c->tot, 0, sizeof c->tot);
+	c->prev = 0;
+	c->have_prev = false;
+	c->mean = 0;
+	c->last_dev = 0;
+	return TAW_OK;
+}
+
+static void change_free(change_ctx *c)
+{
+	free(c->cnt);
+	c->cnt = nullptr;
+}
+
+/* Byte surprise on [0,256]: 0 for the most likely successor of the previous
+ * byte, 256 for an unlikely one. Add-one smoothing keeps a first occurrence
+ * surprising. */
+static unsigned change_byte(change_ctx *c, uint8_t x)
+{
+	unsigned s = 128; /* no context for the first byte */
+	if (c->have_prev) {
+		const size_t k = (size_t)c->prev * 256u + x;
+		const unsigned tot = c->tot[c->prev];
+		const unsigned est = (unsigned)(((uint64_t)(c->cnt[k] + 1u) << 16) /
+		    (tot + 256u)); /* 0..65536 */
+		s = 256u - (est >> 8);
+		if (c->cnt[k] < UINT16_MAX)
+			c->cnt[k]++;
+		if (tot < UINT16_MAX)
+			c->tot[c->prev] = (uint16_t)(tot + 1);
+	}
+	c->prev = x;
+	c->have_prev = true;
+
+	/* A boundary should mark a *change* of context, not merely a byte that
+	 * is surprising in a uniformly surprising region. Compare surprise to
+	 * its EWMA and keep only sizeable deviations. */
+	if (!c->mean) {
+		c->mean = s << 8;
+		c->last_dev = 0;
+	} else {
+		const unsigned m = c->mean >> 8;
+		const unsigned dev = s > m ? s - m : m - s;
+		c->last_dev = dev < 8 ? 0 : dev;
+		const int delta = (int)(s << 8) - (int)c->mean;
+		c->mean = (uint32_t)((int)c->mean + delta / 256);
+	}
+	return s;
+}
+
+/* Sequential reader over any source, with a bounded scratch for non-memory
+ * sources. Used twice: score total, then place the boundaries. */
+typedef struct {
+	const taw_source *src;
+	const uint8_t *view;
+	uint64_t at, total;
+	uint8_t *buf;
+	size_t cap;
+} seq_reader;
+
+static void seq_init(seq_reader *r, const taw_source *src, uint8_t *buf,
+    size_t cap)
+{
+	r->src = src;
+	r->view = taw_source_view(src);
+	r->at = 0;
+	r->total = src->size;
+	r->buf = buf;
+	r->cap = cap;
+}
+
+static taw_status seq_next(seq_reader *r, const uint8_t **p, size_t *n)
+{
+	*n = 0;
+	*p = nullptr;
+	if (r->at >= r->total)
+		return TAW_OK;
+	const uint64_t left = r->total - r->at;
+	const size_t k = left < r->cap ? (size_t)left : r->cap;
+	if (r->view) {
+		*p = r->view + r->at;
+	} else {
+		const taw_status st = r->src->read_at(r->src->ctx, r->at, r->buf, k);
+		if (st != TAW_OK)
+			return st;
+		*p = r->buf;
+	}
+	r->at += k;
+	*n = k;
+	return TAW_OK;
+}
+
+typedef struct {
+	uint32_t *p;
+	size_t n, cap;
+} len_list;
+
+static bool lens_push(len_list *l, uint32_t v)
+{
+	if (l->n == l->cap) {
+		const size_t cap = l->cap ? l->cap * 2 : 64;
+		uint32_t *q = realloc(l->p, cap * sizeof *q);
+		if (!q)
+			return false;
+		l->p = q;
+		l->cap = cap;
+	}
+	l->p[l->n++] = v;
+	return true;
+}
+
+/* Pick raw_len for each block. Target controls min/max length and the number
+ * of equal-change shares; a nonzero change_threshold instead cuts at a
+ * single surprising byte. */
+static taw_status choose_blocks(const taw_source *src, const taw_params *p,
+    uint64_t *nblocks_out, uint64_t **offs_out, uint32_t **lens_out)
+{
+	const uint64_t total = src->size;
+	const uint64_t target = p->chunk_target ? p->chunk_target : p->block_size;
+	const uint64_t min_len = target / 4 ? target / 4 : 1;
+	const uint64_t max4 = target > TAW_CHUNK_MAX / 4 ? TAW_CHUNK_MAX : target * 4;
+	const uint64_t max_len = max4 > target ? max4 : target;
+	const uint64_t ntarget = total ? (total + target - 1) / target : 0;
+	const size_t cap = (size_t)(total < 65536 ? (total ? total : 1) : 65536);
+	uint8_t *scratch = nullptr;
+	change_ctx c = {0};
+	len_list lens = {0};
+	uint64_t *offs = nullptr;
+	taw_status st = TAW_E_NOMEM;
+
+	if (!total) {
+		*nblocks_out = 0;
+		*offs_out = nullptr;
+		*lens_out = nullptr;
+		return TAW_OK;
+	}
+	if (change_init(&c) != TAW_OK)
+		goto out;
+	if (!(scratch = malloc(cap)))
+		goto out;
+
+	/* pass 1: how much change is there in total? */
+	uint64_t total_change = 0;
+	seq_reader r;
+	seq_init(&r, src, scratch, cap);
+	for (;;) {
+		const uint8_t *b;
+		size_t n;
+		if ((st = seq_next(&r, &b, &n)) != TAW_OK)
+			goto out;
+		if (!n)
+			break;
+		for (size_t i = 0; i < n; i++) {
+			change_byte(&c, b[i]);
+			total_change += c.last_dev;
+		}
+	}
+	uint64_t share = ntarget ? total_change / ntarget : 1;
+	if (!share)
+		share = 1;
+
+	/* pass 2: cut where accumulated surprise reaches its share (or at a
+	 * single surprising byte in threshold mode), between min and max. */
+	change_free(&c);
+	if (change_init(&c) != TAW_OK)
+		goto out;
+	seq_init(&r, src, scratch, cap);
+	uint64_t len = 0, acc = 0;
+	for (;;) {
+		const uint8_t *b;
+		size_t n;
+		if ((st = seq_next(&r, &b, &n)) != TAW_OK)
+			goto out;
+		if (!n)
+			break;
+		for (size_t i = 0; i < n; i++) {
+			const unsigned s = change_byte(&c, b[i]);
+			len++;
+			acc += c.last_dev;
+			const bool hit = p->change_threshold
+			    ? s >= p->change_threshold : acc >= share;
+			if (len >= max_len || (len >= min_len && hit)) {
+				if (!lens_push(&lens, (uint32_t)len))
+					goto out;
+				len = acc = 0;
+			}
+		}
+	}
+	if (len && !lens_push(&lens, (uint32_t)len))
+		goto out;
+	if (lens.n > UINT32_MAX)
+		goto out;
+
+	offs = malloc((lens.n + 1) * sizeof *offs);
+	if (!offs)
+		goto out;
+	offs[0] = 0;
+	for (size_t i = 0; i < lens.n; i++)
+		offs[i + 1] = offs[i] + lens.p[i];
+	if (offs[lens.n] != total) {
+		st = TAW_E_FORMAT;
+		goto out;
+	}
+	*nblocks_out = lens.n;
+	*offs_out = offs;
+	*lens_out = lens.p;
+	offs = nullptr;
+	lens.p = nullptr;
+	st = TAW_OK;
+out:
+	free(offs);
+	free(lens.p);
+	free(scratch);
+	change_free(&c);
+	return st;
+}
+
 /* ---- encoder --------------------------------------------------------------- */
 
 typedef struct {
@@ -74,6 +311,9 @@ typedef struct {
 	const taw_source *in;
 	const uint8_t *view;
 	uint64_t total, bs;
+	bool dyn;
+	const uint64_t *offs; /* [nblocks+1], dynamic blocks only */
+	uint64_t max_raw;
 	const taw_model_choice *m;
 	taw_pred *pred;   /* [threads] */
 	bool *pred_ok;
@@ -89,11 +329,12 @@ static void encode_block(void *arg, size_t i, unsigned w)
 {
 	enc_job *J = arg;
 	block_result *r = &J->res[i];
-	const uint64_t off = (uint64_t)i * J->bs;
-	const size_t len = (size_t)(J->total - off < J->bs ? J->total - off : J->bs);
+	const uint64_t off = J->dyn ? J->offs[i] : (uint64_t)i * J->bs;
+	const size_t len = J->dyn ? (size_t)(J->offs[i + 1] - off) :
+	    (size_t)(J->total - off < J->bs ? J->total - off : J->bs);
 	const uint8_t *src = J->view ? J->view + off : nullptr;
 	if (!src) {
-		if (!J->buf[w] && !(J->buf[w] = malloc((size_t)J->bs))) {
+		if (!J->buf[w] && !(J->buf[w] = malloc((size_t)J->max_raw))) {
 			r->st = TAW_E_NOMEM;
 			return;
 		}
@@ -148,6 +389,8 @@ static taw_status write_block(void *arg, size_t i)
 		taw_buf_put_u64(&J->index, J->at);
 		taw_buf_put_u32(&J->index, (uint32_t)n);
 		taw_buf_put_u32(&J->index, r->crc);
+		if (J->dyn)
+			taw_buf_put_u32(&J->index, (uint32_t)r->raw_len);
 		J->at += n;
 	}
 	taw_buf_free(&r->out);
@@ -173,15 +416,31 @@ taw_status taw_seek_encode(const taw_source *src, const taw_params *params,
 	if (st != TAW_OK)
 		return st;
 	const uint64_t total = src->size, bs = p.block_size;
-	const uint64_t nblocks = (total + bs - 1) / bs;
+	uint64_t nblocks = (total + bs - 1) / bs;
+	uint64_t *offs = nullptr;
+	uint32_t *lens = nullptr;
+	if (p.dyn_blocks &&
+	    (st = choose_blocks(src, &p, &nblocks, &offs, &lens)) != TAW_OK)
+		return st;
 	if (nblocks > UINT32_MAX || nfiles > UINT32_MAX ||
-	    !files_valid(files, nfiles, total))
+	    !files_valid(files, nfiles, total)) {
+		free(offs);
+		free(lens);
 		return TAW_E_ARG;
+	}
 	const unsigned threads = p.threads ? p.threads : 1;
+	uint64_t max_raw = bs;
+	if (p.dyn_blocks)
+		for (uint64_t i = 0; i < nblocks; i++)
+			if (offs[i + 1] - offs[i] > max_raw)
+				max_raw = offs[i + 1] - offs[i];
 
 	taw_model_choice m;
-	if ((st = taw_model_fit_source(src, bs, &p, &m)) != TAW_OK)
+	if ((st = taw_model_fit_source(src, bs, &p, &m)) != TAW_OK) {
+		free(offs);
+		free(lens);
 		return st;
+	}
 
 	taw_buf head = {0};
 	taw_header h = {
@@ -189,7 +448,8 @@ taw_status taw_seek_encode(const taw_source *src, const taw_params *params,
 		.profile = m.profile,
 		.quant = m.quant,
 		.level = (uint8_t)p.level,
-		.flags = nfiles ? TAW_FLAG_FILES : 0,
+		.flags = (nfiles ? TAW_FLAG_FILES : 0) |
+		    (p.dyn_blocks ? TAW_FLAG_DYN_BLOCKS : 0),
 		.block_size = p.block_size,
 		.model_size = m.model_size,
 		.model_crc = taw_crc32c(0, m.model, m.model_size),
@@ -198,7 +458,8 @@ taw_status taw_seek_encode(const taw_source *src, const taw_params *params,
 	taw_buf_put(&head, m.model, m.model_size);
 
 	enc_job J = {.in = src, .view = taw_source_view(src), .total = total,
-		.bs = bs, .m = &m, .sink = out, .at = head.n};
+		.bs = bs, .dyn = p.dyn_blocks, .offs = offs, .max_raw = max_raw,
+		.m = &m, .sink = out, .at = head.n};
 	unsigned tw = threads < nblocks ? threads : (unsigned)(nblocks ? nblocks : 1);
 	J.pred = calloc(tw, sizeof *J.pred);
 	J.pred_ok = calloc(tw, sizeof *J.pred_ok);
@@ -239,6 +500,8 @@ taw_status taw_seek_encode(const taw_source *src, const taw_params *params,
 	taw_buf_free(&J.index);
 	taw_buf_free(&head);
 	free(m.model);
+	free(offs);
+	free(lens);
 	return st;
 }
 
@@ -250,6 +513,7 @@ taw_status taw_seek_encode(const taw_source *src, const taw_params *params,
 typedef struct {
 	uint64_t offset;
 	uint32_t coded_len, crc;
+	uint32_t raw_len; /* dynamic blocks only */
 } seek_entry;
 
 struct taw_seek {
@@ -258,7 +522,10 @@ struct taw_seek {
 	uint8_t *model;
 	taw_pred pr;
 	uint64_t total;
+	bool dyn;
 	uint32_t nblocks;
+	uint64_t *raw_off; /* [nblocks+1], decoded offsets, dynamic blocks only */
+	uint64_t max_raw;
 	seek_entry *ent;
 	taw_file *files;  /* names point into names */
 	size_t nfiles;
@@ -385,11 +652,12 @@ static taw_status seek_load(taw_seek *s)
 		goto out;
 	s->nblocks = taw_rd32(ix + 4);
 	s->total = taw_rd64(ix + 8);
+	s->dyn = (s->h.flags & TAW_FLAG_DYN_BLOCKS) != 0;
 	const uint64_t bs = s->h.block_size;
-	if (s->total / bs + (s->total % bs != 0) != s->nblocks)
+	const size_t esz = s->dyn ? TAW_INDEX_ENTRY_DYN : TAW_INDEX_ENTRY;
+	if (!s->dyn && s->total / bs + (s->total % bs != 0) != s->nblocks)
 		goto out;
-	const uint64_t entries_end =
-	    TAW_INDEX_HEAD + (uint64_t)s->nblocks * TAW_INDEX_ENTRY;
+	const uint64_t entries_end = TAW_INDEX_HEAD + (uint64_t)s->nblocks * esz;
 	const bool has_files = s->h.flags & TAW_FLAG_FILES;
 	if (has_files ? index_len < entries_end : index_len != entries_end)
 		goto out;
@@ -397,9 +665,13 @@ static taw_status seek_load(taw_seek *s)
 	s->ent = calloc(s->nblocks ? s->nblocks : 1, sizeof *s->ent);
 	if (!s->ent)
 		goto out;
+	if (s->dyn && !(s->raw_off = malloc(((size_t)s->nblocks + 1) *
+	    sizeof *s->raw_off)))
+		goto out;
 	st = TAW_E_FORMAT;
+	uint64_t raw_end = 0;
 	for (uint32_t i = 0; i < s->nblocks; i++) {
-		const uint8_t *e = ix + TAW_INDEX_HEAD + (size_t)i * TAW_INDEX_ENTRY;
+		const uint8_t *e = ix + TAW_INDEX_HEAD + (size_t)i * esz;
 		seek_entry *en = &s->ent[i];
 		en->offset = taw_rd64(e);
 		en->coded_len = taw_rd32(e + 8);
@@ -407,6 +679,24 @@ static taw_status seek_load(taw_seek *s)
 		if (en->offset < data_start || en->offset > index_off ||
 		    en->coded_len > index_off - en->offset)
 			goto out;
+		if (s->dyn) {
+			en->raw_len = taw_rd32(e + 16);
+			if (en->raw_len == 0 || en->raw_len > TAW_CHUNK_MAX ||
+			    en->coded_len > en->raw_len ||
+			    en->raw_len > s->total - raw_end)
+				goto out;
+			s->raw_off[i] = raw_end;
+			raw_end += en->raw_len;
+			if (en->raw_len > s->max_raw)
+				s->max_raw = en->raw_len;
+		}
+	}
+	if (s->dyn) {
+		if (raw_end != s->total)
+			goto out;
+		s->raw_off[s->nblocks] = raw_end;
+	} else {
+		s->max_raw = bs;
 	}
 	st = TAW_OK;
 	if (has_files)
@@ -454,11 +744,34 @@ long taw_seek_find(const taw_seek *s, const char *name)
 	return -1;
 }
 
+static uint64_t block_start(const taw_seek *s, uint32_t i)
+{
+	return s->dyn ? s->raw_off[i] : (uint64_t)i * s->h.block_size;
+}
+
 static size_t block_raw_len(const taw_seek *s, uint32_t i)
 {
-	uint64_t start = (uint64_t)i * s->h.block_size;
+	if (s->dyn)
+		return s->ent[i].raw_len;
+	uint64_t start = block_start(s, i);
 	uint64_t left = s->total - start;
 	return left < s->h.block_size ? (size_t)left : s->h.block_size;
+}
+
+/* Block containing byte off (off < total). */
+static uint32_t block_at(const taw_seek *s, uint64_t off)
+{
+	if (!s->dyn)
+		return (uint32_t)(off / s->h.block_size);
+	uint32_t lo = 1, hi = s->nblocks;
+	while (lo < hi) {
+		const uint32_t mid = lo + (hi - lo) / 2;
+		if (s->raw_off[mid] <= off)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo - 1;
 }
 
 /* Decode block i into out (block_raw_len bytes) with pr and the coded
@@ -497,7 +810,7 @@ static taw_status load_block(taw_seek *s, uint32_t i)
 		return TAW_OK;
 	s->cached = -1;
 	if (!s->block) {
-		s->block = malloc(s->h.block_size);
+		s->block = malloc((size_t)s->max_raw);
 		if (!s->block)
 			return TAW_E_NOMEM;
 	}
@@ -543,7 +856,7 @@ static void read_one(void *arg, size_t j, unsigned w)
 	taw_seek *s = R->s;
 	seek_worker *k = &s->wk[w];
 	const uint32_t i = R->first + (uint32_t)j;
-	const uint64_t bs = s->h.block_size, start = (uint64_t)i * bs;
+	const uint64_t start = block_start(s, i);
 	const size_t len = block_raw_len(s, i);
 	taw_status st = TAW_OK;
 	if (!k->pr_ok) {
@@ -557,9 +870,11 @@ static void read_one(void *arg, size_t j, unsigned w)
 	}
 	/* Whole blocks go straight to dst; the edges through a buffer. */
 	const bool whole = start >= R->off && start + len <= R->off + R->n;
-	uint8_t *out = R->dst + (start - R->off);
-	if (!whole) {
-		if (!k->block && !(k->block = malloc((size_t)bs))) {
+	uint8_t *out;
+	if (whole) {
+		out = R->dst + (start - R->off);
+	} else {
+		if (!k->block && !(k->block = malloc((size_t)s->max_raw))) {
 			R->st[j] = TAW_E_NOMEM;
 			return;
 		}
@@ -601,17 +916,15 @@ taw_status taw_seek_read(taw_seek *s, uint64_t off, void *dst, size_t n)
 	if (off > s->total || n > s->total - off)
 		return TAW_E_RANGE;
 	if (n && s->threads > 1) {
-		const uint64_t bs = s->h.block_size;
-		const uint32_t first = (uint32_t)(off / bs);
-		const uint32_t last = (uint32_t)((off + n - 1) / bs);
+		const uint32_t first = block_at(s, off);
+		const uint32_t last = block_at(s, off + n - 1);
 		if (last > first)
 			return read_parallel(s, off, dst, n, first, last);
 	}
 	uint8_t *d = dst;
-	const uint64_t bs = s->h.block_size;
 	while (n) {
-		uint32_t i = (uint32_t)(off / bs);
-		size_t in = (size_t)(off % bs);
+		uint32_t i = block_at(s, off);
+		size_t in = (size_t)(off - block_start(s, i));
 		taw_status st = load_block(s, i);
 		if (st != TAW_OK)
 			return st;
@@ -634,6 +947,7 @@ void taw_seek_close(taw_seek *s)
 	taw_pred_free(&s->pr);
 	free(s->model);
 	free(s->ent);
+	free(s->raw_off);
 	free(s->files);
 	free(s->names);
 	free(s->coded);

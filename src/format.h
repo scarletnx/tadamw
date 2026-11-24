@@ -27,7 +27,10 @@ constexpr uint8_t TAW_QUANT_IQ4 = 10;
 constexpr uint8_t TAW_QUANT_IQ2 = 11;
 constexpr uint8_t TAW_QUANT_COUNT = 12;
 
-constexpr uint8_t TAW_FLAG_FILES = 1; /* awseek: the index has a directory */
+constexpr uint8_t TAW_FLAG_FILES = 1;     /* awseek: the index has a directory */
+constexpr uint8_t TAW_FLAG_DYN_BLOCKS = 2; /* awseek: variable-length blocks;
+                                              index entries carry raw_len */
+constexpr uint8_t TAW_FLAG_ALL = TAW_FLAG_FILES | TAW_FLAG_DYN_BLOCKS;
 constexpr size_t TAW_NAME_MAX = 4096;
 
 constexpr size_t TAW_HEADER_SIZE = 32;
@@ -36,7 +39,8 @@ constexpr uint32_t TAW_BLOCK_MIN = 1u << 12;
 constexpr uint32_t TAW_BLOCK_MAX = 1u << 30;
 constexpr size_t TAW_FOOTER_SIZE = 16;
 constexpr size_t TAW_INDEX_HEAD = 16;
-constexpr size_t TAW_INDEX_ENTRY = 16;
+constexpr size_t TAW_INDEX_ENTRY = 16;      /* fixed blocks */
+constexpr size_t TAW_INDEX_ENTRY_DYN = 20;  /* + u32 raw_len (flag bit 1) */
 
 #define TAW_MAGIC "TAW\x1A"
 #define TAW_INDEX_MAGIC "TAWI"
