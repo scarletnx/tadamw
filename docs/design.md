@@ -254,8 +254,8 @@ only: they are tuning hooks, not CLI options or API fields, they do not
 change the archive format, and they never affect decoding or random access.
 Unset means shipped behaviour; diagnostics print to stderr only.
 
-The knobs below are the supported survivors of the in-flight fitting studies,
-grouped by feature. Each group states its byte-identity guarantee.
+The knobs are grouped by feature. Each group states its byte-identity
+guarantee.
 
 ### FARO-ERC allocation
 
@@ -338,53 +338,29 @@ archive — including MALTER/Muon runs — is identical to the shipped one.
 `late` is opt-in via the environment only, and GPU warm-start nets are not
 averaged.
 
-### Predictor choices allocated under R-4
+### Predictor choices: gate and hnet
 
-`taw c -p gate` (entropy-adaptive confidence gate, profile 11) and
-`taw c -p hnet` (integer H-Net boundary input, profile 14) are opt-in
-predictor studies. Integration ruling R-4 allocates predictor value 11 to
-`TAW_PREDICTOR_GATE` and value 14 to `TAW_PREDICTOR_HNET`, with matching
-arithmetic-profile ids; `-p gate` and `-p hnet` are their `--help` and CLI
-token names, shipped with PRs #11 and #13. The canonical format registry in
-`docs/format.md` §2 still lists only profiles 0 and 1 — ids 2..255 remain
-reserved and must be refused until the corresponding PR lands — but no
-further id allocation is needed for these two choices. Loader validation,
-golden vectors, the CLI round-trip test, `--help` and the README usage line
-land with each PR. The default `auto`/`mix` path stays byte-identical.
+`taw c -p gate` selects the entropy-adaptive confidence gate (predictor 11,
+arithmetic profile 11); `taw c -p hnet` selects the integer H-Net boundary
+input (predictor 14, arithmetic profile 14). These map to
+`TAW_PREDICTOR_GATE` and `TAW_PREDICTOR_HNET`; `-p gate` and `-p hnet` are
+their CLI token names. Other arithmetic profiles remain reserved and are
+refused by the loader (docs/format.md §2). The default `auto`/`mix` path
+stays byte-identical.
 
 ### Calibrated mixer (profile 6)
 
 `TAW_CALIBRATED=0|1|on|cal` (default `0`, i.e. off; `1`, `on` and `cal` enable)
 opts the fitter into profile 6 (`CALIBRATED_MIX`), which stores eight bytes of
-fitted temperature/bias/weight parameters in the archive. Integration ruling
-R-4 allocates predictor value 6 to `TAW_PREDICTOR_CALIBRATED` with the `-p cal`
-CLI token (PR #10); `auto`/`mix` still fit profile 1 only.
+fitted temperature/bias/weight parameters in the archive. Predictor value 6
+is `TAW_PREDICTOR_CALIBRATED` with the `-p cal` CLI token; `auto`/`mix` still
+fit profile 1 only.
 The test suite also reads `TAW_CAL_PARAMS=temp,bias,w0,w1,w2` and
 `TAW_CAL_NO_APM=1` as ablation overrides (encoder-only, unset by default);
 they are not product knobs. Profile 6 candidates fit on the CPU even with
 `-g on`/`-g auto`, to keep the held-out-sample path.
 **Byte identity:** with `TAW_CALIBRATED` unset (or `0`) every archive is the
 shipped profile-1 result.
-
-### Historical names (provenance only — not valid in current code)
-
-These tokens appear in the archived benchmark matrix (`exp/final-matrix`) and
-in earlier experiment reports. They are **not accepted by current code**;
-they exist here only to explain historical env strings. Do not copy them into
-new commands or docs.
-
-| archived token | status / current equivalent |
-|----------------|-----------------------------|
-| `TAW_SIGN_BETA` | renamed → `TAW_EPS_SIGN_BETA` |
-| `TAW_GATE_P` | renamed → `TAW_EPS_GATE_P` |
-| `TAW_GATE_MODE` | renamed → `TAW_EPS_GATE_MODE` (code rename still pending) |
-| `TAW_FARO_ROUTE` | rejected routing lane; no equivalent — FARO-ERC has no route knob |
-| `TAW_FIT_LRSCALE` | removed knob; use `TAW_LR0` / `TAW_LR1` |
-
-`TAW_FIT_LRSCALE` was removed from #19's pre-fix `bench/control.sh` and is
-cited in that PR's results; it is not present in the staged #21 tree. The
-other four tokens do occur in #21's archived env strings, where they identify
-pre-rename binaries from unmerged branches.
 
 ## GPU fitting
 

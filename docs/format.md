@@ -19,10 +19,8 @@ Two variants share one header and one model section:
 ## Allocation registry (central ledger)
 
 This is the single source of truth for arithmetic-profile IDs and awseek flag
-bits. It is maintained by the Format Registrar in the `REGISTRY.md` ruling;
-PRs MUST NOT write their own "reserved, refuse" ranges or claim a section
-number for themselves. Section numbers follow the rule *section number =
-profile ID*; profiles 0 and 1 are grandfathered at §2.1/§2.2 and §5.1.
+bits. Section numbers follow the rule *section number = profile ID*; profiles
+0 and 1 are grandfathered at §2.1/§2.2 and §5.1.
 
 | id / bit | name | owner | canonical section(s) | status on this base |
 |----------|------|-------|----------------------|---------------------|
@@ -37,19 +35,17 @@ profile ID*; profiles 0 and 1 are grandfathered at §2.1/§2.2 and §5.1.
 | profile 10 | `F32_CHAINED_MIX` | PR #17 | — | denied: negative result (3 of 4 cells worse) |
 | profile 12 | `MDL_TREE` | PR #16 | — | denied: default-path change, L1-only; encoder-only knob instead |
 
-Denied and held IDs are recorded so that no PR may describe them as free;
-decoders MUST refuse them until a later ruling allocates them. No quant ID is
-allocated by this ledger: quant ids `5..11` (`Q4`, `Q2`, `FP8`, `NVFP4`,
-`IQ8`, `IQ4`, `IQ2`) stay exactly as specified in §3, and every retained
-profile uses the profile-1 quant set. §2.3 and §5.2 are sealed (see below).
+Denied and held IDs are reserved: decoders MUST refuse them. No quant ID is
+added here: quant ids `5..11` (`Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4`,
+`IQ2`) stay exactly as specified in §3, and every retained profile uses the
+profile-1 quant set. §2.3 and §5.2 are sealed (see below).
 
 ### Predictor enum (`taw_predictor`, API only)
 
 The public `taw_predictor` selector is an encoder-side choice and is **not**
 stored in an archive: header bytes 6 and 7 carry `arith_profile` and `quant`.
-This allocation is integration ruling R-4; it does not change the
-arithmetic-profile table above, which remains the sole authority for profile
-IDs.
+Predictor values do not change the arithmetic-profile table above, which
+remains the sole authority for profile IDs.
 
 | value | enum name | profile | status |
 |-------|-----------|---------|--------|
@@ -63,10 +59,9 @@ IDs.
 Values `3..5`, `7..10`, `12..13` and `15..255` are refused:
 `taw_params_resolve()` returns `TAW_E_ARG` and the CLI offers no name for
 them. Value 11 is the only allocated value in the nominal `7..13` range,
-because predictor values equal their profile IDs. The early-prototype value
-3 is **void**: it was never allocated, was claimed by mutually incompatible
-PRs, and never shipped in a merged build. No predictor value is assigned to
-the denied or held profile IDs 3, 7, 8, 10 or 12.
+because predictor values equal their profile IDs. Value 3 is **void**: it is
+not allocated. No predictor value is assigned to the denied or held profile
+IDs 3, 7, 8, 10 or 12.
 
 ## 1. File header (32 bytes)
 
@@ -93,9 +88,8 @@ fall back to a different arithmetic: an archive decodes exactly or not at all.
 
 For awseek, `block_size` MUST be a power of two in `[2^12, 2^30]`.
 
-Flag bit 1 is allocated to PR #15 as a container-only extension (§7.2) and a
-20-byte index-entry layout has been proposed for it, but neither is normative
-on this base: a decoder still refuses flag bit 1 as an unsupported flag.
+Flag bit 1 is reserved for the container-only extension in §7.2; a decoder on
+this base refuses it as an unsupported flag.
 
 ## 2. Arithmetic profiles
 
@@ -374,34 +368,24 @@ and the same `A2` entry are updated: `e += (65535 - e) >> 6` if `b`, else
 ### 2.3 (sealed — profile-1-only)
 
 This subsection number is sealed. It is reserved for profile-1 material only
-and MUST NOT be used to document any other arithmetic profile. Several
-in-flight PRs proposed to add a new profile here; those claims are void. The
-canonical numbers are §2.6, §2.11 and §2.14. See the allocation registry and
-the `REGISTRY.md` ruling.
+and MUST NOT be used to document any other arithmetic profile. Other profiles
+use §2.6, §2.11 and §2.14.
 
-### 2.6 Profile 6: `CALIBRATED_MIX` (PR #10)
+### 2.6 Profile 6: `CALIBRATED_MIX`
 
-Allocated placeholder. The normative arithmetic is introduced by PR #10 and
-is not part of this base; when that PR lands, its §2.3 text is renumbered to
-§2.6 (and its §5.2 text to §5.6). Until then `arith_profile = 6` is refused.
-Predictor slot `TAW_PREDICTOR_CALIBRATED = 6` / CLI `-p cal` is allocated by
-integration ruling R-4. See the `REGISTRY.md` ruling.
+Reserved; `arith_profile = 6` is refused. Predictor slot
+`TAW_PREDICTOR_CALIBRATED = 6` uses the CLI token `-p cal`.
 
-### 2.11 Profile 11: `ENTROPY_GATE` (PR #11)
+### 2.11 Profile 11: `ENTROPY_GATE`
 
-Allocated placeholder. Normative text arrives with PR #11 as §2.11 / §5.11.
-Until then `arith_profile = 11` is refused. Predictor slot
-`TAW_PREDICTOR_GATE = 11` / CLI `-p gate` is allocated by integration ruling
-R-4. See the `REGISTRY.md` ruling.
+Reserved; `arith_profile = 11` is refused. Predictor slot
+`TAW_PREDICTOR_GATE = 11` uses the CLI token `-p gate`.
 
-### 2.14 Profile 14: `HNET_BOUNDARY` (PR #13)
+### 2.14 Profile 14: `HNET_BOUNDARY`
 
-Allocated placeholder. PR #13 already uses §2.14; on landing, its model text
-becomes §5.14 rather than an edit to the shared §5.1 validation text. Until
-then `arith_profile = 14` is refused. Predictor slot `TAW_PREDICTOR_HNET =
-14` / CLI `-p hnet` is allocated by integration ruling R-4; predictor value 3
-is void and `3..5`, `7..10`, `12..13` are refused. See the `REGISTRY.md`
-ruling.
+Reserved; `arith_profile = 14` is refused. Predictor slot
+`TAW_PREDICTOR_HNET = 14` uses the CLI token `-p hnet`. Value 3 is void, and
+`3..5`, `7..10` and `12..13` are refused (see the predictor enum above).
 
 ## 3. Quantization formats
 
@@ -548,26 +532,21 @@ unit.
 ### 5.2 (sealed — profile-1-only)
 
 This subsection number is sealed and reserved for profile-1 material; it
-MUST NOT be used for any other profile's model section. New profiles use
-§5.6, §5.11 and §5.14. See the allocation registry and the `REGISTRY.md`
-ruling.
+MUST NOT be used for any other profile's model section. Other profiles use
+§5.6, §5.11 and §5.14.
 
-### 5.6 Profile 6 model (PR #10)
+### 5.6 Profile 6 model
 
-Allocated placeholder; the 16-byte head and payload arrive with PR #10.
-Refused on this base. See the `REGISTRY.md` ruling.
+Reserved; a profile-6 model is refused on this base.
 
-### 5.11 Profile 11 model (PR #11)
+### 5.11 Profile 11 model
 
-Allocated placeholder; the 4-byte gate tail arrives with PR #11. Refused on
-this base. See the `REGISTRY.md` ruling.
+Reserved; a profile-11 model is refused on this base.
 
-### 5.14 Profile 14 model (PR #13)
+### 5.14 Profile 14 model
 
-Allocated placeholder. Profile 14 reuses the §5.1 head and row encodings with
-row width 27 instead of 26; that deviation is specified here when PR #13
-lands, not by editing the shared §5.1 checks. Refused on this base. See the
-`REGISTRY.md` ruling.
+Reserved; a profile-14 model is refused on this base. It reuses the §5.1 head
+and row encodings with row width 27 instead of 26.
 
 ## 6. aw body (kind 0)
 
@@ -618,9 +597,9 @@ the entries are followed by the file directory (§7.1), still inside the index
 and covered by `index_crc`.
 
 The 16-byte entry above is the normative version-1 layout. A 20-byte entry
-adding `u32 raw_len` behind awseek flag bit 1 (allocated to PR #15, §7.2) is a
-**proposed extension**, not part of this document: a decoder on this base
-MUST refuse flag bit 1 rather than parse such an index.
+adding `u32 raw_len` behind awseek flag bit 1 (§7.2) is a proposed extension,
+not part of this document: a decoder on this base MUST refuse flag bit 1
+rather than parse such an index.
 
 Footer (the last 16 bytes of the file):
 
@@ -654,9 +633,8 @@ Rules (a decoder MUST refuse a directory that breaks one):
 
 Bytes outside every file are allowed but carry no name.
 
-### 7.2 Variable-length blocks (PR #15)
+### 7.2 Variable-length blocks
 
-Allocated placeholder for a container-only extension: awseek flag bit 1 and
-20-byte index entries carrying `raw_len`. It is not normative on this base;
-the flag remains refused and the index remains 16-byte (§7). See the
-allocation registry and the `REGISTRY.md` ruling.
+Reserved container-only extension: awseek flag bit 1 and 20-byte index entries
+carrying `raw_len`. It is not normative on this base; the flag remains
+refused and the index remains 16-byte (§7).

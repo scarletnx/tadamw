@@ -5,7 +5,7 @@
  * optimizer ABI. The GPU trainer (fit_gpu.c, fit_gpu.comp) has its own GLSL
  * Adam and never includes this header; the CPU hooks are NULL there.
  *
- * DERIVED FROM STRUCTURE.md (commit 10d3fd4). Bit-exactness rules:
+ * Bit-exactness rules:
  *  - the coefficients -4.7750f / 2.0315f / 3.4445f and the i/j/k accumulation
  *    order in ns_ortho() are ABI, not style;
  *  - fsqrt() lives here too so there is one implementation, not one per TU;
