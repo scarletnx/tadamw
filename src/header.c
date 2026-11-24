@@ -66,6 +66,9 @@ taw_status taw_header_parse(const uint8_t *p, size_t n, taw_header *h)
 	return TAW_OK;
 }
 
+/* The one shared predictor allowlist is taw_predictor_supported() in
+ * format.h; do not duplicate it here. */
+
 taw_status taw_params_resolve(const taw_params *in, taw_params *out)
 {
 	*out = in ? *in : (taw_params){0};
@@ -73,23 +76,9 @@ taw_status taw_params_resolve(const taw_params *in, taw_params *out)
 		out->level = TAW_LEVEL_DEFAULT;
 	if (out->level < TAW_LEVEL_MIN || out->level > TAW_LEVEL_MAX)
 		return TAW_E_ARG;
-	/* R-4 predictor policy: value 3 is void (bad argument); 6/11/14 are
-	 * allocated to sibling profiles that are not implemented here, so they
-	 * report TAW_E_UNSUPPORTED as on #11/#13. Implemented 0/1/2 pass.
-	 * This replaces the old implicit "> MIX" upper bound. */
-	switch (out->predictor) {
-	case TAW_PREDICTOR_AUTO:
-	case TAW_PREDICTOR_ORDER0:
-	case TAW_PREDICTOR_MIX:
-		break;
-	case TAW_PREDICTOR_CALIBRATED:
-	case TAW_PREDICTOR_GATE:
-	case TAW_PREDICTOR_HNET:
-		return TAW_E_UNSUPPORTED;
-	default:
-		return TAW_E_ARG;
-	}
-	if ((unsigned)out->weights > TAW_WEIGHTS_IQ2)
+	/* Single predictor allowlist in src/format.h; value 3 is void. */
+	if (!taw_predictor_supported((unsigned)out->predictor) ||
+	    (unsigned)out->weights > TAW_WEIGHTS_IQ2)
 		return TAW_E_ARG;
 	if ((unsigned)out->gpu > TAW_GPU_ON)
 		return TAW_E_ARG;

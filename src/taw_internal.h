@@ -124,12 +124,14 @@ static inline int taw_rc_dec_bit(taw_rc_dec *d, uint32_t p1)
 /* ---- predictor / arithmetic profiles (docs/format.md §2) ---------------- */
 
 struct taw_p1;
+struct taw_hnet;
 
 typedef struct {
 	uint8_t profile;
 	uint32_t c0;     /* partial byte with leading 1 bit, 1..255 */
 	uint16_t p[256]; /* profile 0 state */
-	struct taw_p1 *p1; /* profile 1 state (heap), else nullptr */
+	struct taw_p1 *p1;   /* profile 1 state (heap), else nullptr */
+	struct taw_hnet *hn; /* profile 14 state (heap), else nullptr */
 } taw_pred;
 
 /* Is (profile, quant) a pair this build can decode? */
@@ -144,6 +146,10 @@ void taw_pred_free(taw_pred *pr);
 
 /* Return to the start-of-coding-unit state; the model is kept. */
 void taw_pred_reset(taw_pred *pr);
+/* Encoder fitting helpers for the mixer profiles: P(bit=1)*65536 for the
+ * current state (without changing it), then advance over a known bit. */
+uint32_t taw_pred_prob(taw_pred *pr);
+void taw_pred_advance(taw_pred *pr, int bit);
 
 void taw_pred_encode(taw_pred *pr, taw_rc_enc *e, const uint8_t *src,
     size_t n);

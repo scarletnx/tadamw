@@ -23,6 +23,16 @@ bool taw_gpu_fits(const p1_shape *s)
 	return s->hidden <= 16; /* fit_gpu.comp's HM */
 }
 
+/* The shaders, layout_of() and pad_rows() below all assume the profile-1
+ * row width P1_F (26). Profile 14 rows are P1_F_HNET (27) wide; passing one
+ * of its nets here would silently copy/read with the wrong stride. The
+ * encoder already keeps profile 14 on the CPU; reject it here too so the
+ * hazard cannot be reached from another caller. */
+static bool gpu_net_fits(const tnet *t)
+{
+	return t->f == P1_F;
+}
+
 #if TAW_GPU
 
 #include <dlfcn.h>
@@ -594,7 +604,8 @@ static gpu_layout layout_of(const tnet *t)
 	return l;
 }
 
-/* Between tnet rows (row1 = H x 26 per set, row2) and padded vec4 rows. */
+/* Between tnet rows (row1 = H x P1_F per set, row2) and padded vec4 rows.
+ * taw_gpu_train rejects t->f != P1_F before this is called. */
 static void pad_rows(const tnet *t, const gpu_layout *l, float *gpu,
     float *cpu, bool to_gpu)
 {
@@ -752,6 +763,11 @@ taw_status taw_gpu_train(taw_gpu *g, tnet *nets, size_t k, int epochs,
 {
 	if (k == 0)
 		return TAW_OK;
+	if (!nets)
+		return TAW_E_ARG;
+	for (size_t i = 0; i < k; i++)
+		if (!gpu_net_fits(&nets[i]))
+			return TAW_E_ARG;
 	gbuf pb = {0}, mb = {0}, bb = {0};
 	float *hp = nullptr;
 	uint32_t *hm = nullptr;
@@ -781,10 +797,13 @@ taw_status taw_gpu_train(taw_gpu *g, tnet *nets, size_t k, int epochs,
     const uint64_t *seeds)
 {
 	(void)g;
-	(void)nets;
-	(void)k;
 	(void)epochs;
 	(void)seeds;
+	if (k && (!nets))
+		return TAW_E_ARG;
+	for (size_t i = 0; i < k; i++)
+		if (!gpu_net_fits(&nets[i]))
+			return TAW_E_ARG;
 	return TAW_E_GPU;
 }
 

@@ -101,6 +101,24 @@ if(NOT want STREQUAL got)
   message(FATAL_ERROR "profile 1 range extract mismatch")
 endif()
 
+# Profile 14 (H-Net boundary input), forced: stream and seekable.
+foreach(w f16 q8)
+  run("${TAW}" c -l 1 -p hnet -w ${w} "${INPUT}" "${WORK}/hnet.${w}.aw")
+  run("${TAW}" d "${WORK}/hnet.${w}.aw" "${WORK}/hnet.${w}.bin")
+  same("${INPUT}" "${WORK}/hnet.${w}.bin")
+  execute_process(COMMAND "${TAW}" i "${WORK}/hnet.${w}.aw" OUTPUT_VARIABLE info)
+  if(NOT info MATCHES "profile: +14 \\(HNET_BOUNDARY\\)" OR NOT info MATCHES "\\(${w}\\)")
+    message(FATAL_ERROR "unexpected info output:\n${info}")
+  endif()
+endforeach()
+run("${TAW}" c -l 1 -p hnet -B 16384 "${INPUT}" "${WORK}/hnet.awseek")
+run("${TAW}" x "${WORK}/hnet.awseek" 15000 5000 "${WORK}/hnet_range.bin")
+file(READ "${INPUT}" want OFFSET 15000 LIMIT 5000 HEX)
+file(READ "${WORK}/hnet_range.bin" got HEX)
+if(NOT want STREQUAL got)
+  message(FATAL_ERROR "profile 14 range extract mismatch")
+endif()
+
 # Bad option values are usage errors.
 execute_process(COMMAND "${TAW}" c -p bogus "${INPUT}" "${WORK}/bad.aw"
                 RESULT_VARIABLE rc ERROR_QUIET)

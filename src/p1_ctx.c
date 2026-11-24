@@ -6,6 +6,7 @@
 #include <sys/mman.h>
 
 #include "p1.h"
+#include "taw_internal.h"
 
 const uint16_t p1_sel_size[P1_SEL_COUNT] = {1, 8, 8, 256, 256, 4096};
 
@@ -461,4 +462,58 @@ void p1_ctx_boundary(p1_ctx *c, int bit)
 	case 8: byte_end(c); break;
 	default: break;
 	}
+}
+
+/* ---- profile 11: entropy-adaptive gate helpers ---------------------------
+ * Shared by the decoder's inference and the encoder's gate fitting so both
+ * use exactly the same integer arithmetic. */
+
+void p11_features(const int16_t st[P1_NCTX], int32_t *mean_out,
+    int32_t *mad_out)
+{
+	int32_t sum = 0;
+	for (unsigned i = 0; i < P1_NCTX; i++)
+		sum += st[i];
+	/* sum is in [-25*2047, 25*2047], so both values fit in int32. */
+	int32_t mean = (sum >= 0 ? sum + 12 : sum - 12) / 25;
+	int32_t dev = 0;
+	for (unsigned i = 0; i < P1_NCTX; i++) {
+		int32_t d = st[i] - mean;
+		dev += d < 0 ? -d : d;
+	}
+	*mean_out = mean;
+	*mad_out = (dev + 12) / 25;
+}
+
+uint32_t p11_gate_p(uint32_t p_mlp, uint32_t p_ctx, int32_t mad,
+    const p11_gate *g)
+{
+	int32_t prod = (int32_t)g->b * mad;
+	/* floor(prod / 2^P11_GATE_SHIFT), also for negative prod. */
+	int32_t q = prod >= 0 ? prod >> P11_GATE_SHIFT
+			      : -((-prod + (1 << P11_GATE_SHIFT) - 1) >>
+				  P11_GATE_SHIFT);
+	int32_t v = (int32_t)g->a + q;
+	uint32_t w = v < 0 ? 0u : v > 256 ? 256u : (uint32_t)v;
+	return ((256u - w) * p_mlp + w * p_ctx + 128u) >> 8;
+}
+
+taw_status p11_gate_parse(const uint8_t *p, size_t n, p11_gate *g)
+{
+	if (n < P11_GATE_SIZE)
+		return TAW_E_FORMAT;
+	int16_t a = (int16_t)taw_rd16(p), b = (int16_t)taw_rd16(p + 2);
+	if (a < P11_GATE_A_MIN || a > P11_GATE_A_MAX ||
+	    b < P11_GATE_B_MIN || b > P11_GATE_B_MAX)
+		return TAW_E_FORMAT;
+	*g = (p11_gate){.a = a, .b = b};
+	return TAW_OK;
+}
+
+void p11_gate_write(uint8_t out[P11_GATE_SIZE], const p11_gate *g)
+{
+	out[0] = (uint8_t)(uint16_t)g->a;
+	out[1] = (uint8_t)((uint16_t)g->a >> 8);
+	out[2] = (uint8_t)(uint16_t)g->b;
+	out[3] = (uint8_t)((uint16_t)g->b >> 8);
 }

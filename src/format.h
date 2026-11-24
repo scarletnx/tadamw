@@ -5,13 +5,29 @@
 
 #include <stdint.h>
 
+#include "tadamw/tadamw.h"
+
+/* Predictor values equal profile IDs for the new profiles; 0/1/2 are
+ * grandfathered. This is the one allowlist used by API
+ * validation (src/header.c) and the CLI parser; their explicit values must
+ * agree. Value 3 is void. */
+static inline bool taw_predictor_supported(unsigned v)
+{
+	return v == TAW_PREDICTOR_AUTO || v == TAW_PREDICTOR_ORDER0 ||
+	    v == TAW_PREDICTOR_MIX || v == TAW_PREDICTOR_CALIBRATED ||
+	    v == TAW_PREDICTOR_GATE || v == TAW_PREDICTOR_HNET;
+}
+
 constexpr uint8_t TAW_FORMAT_VERSION = 1;
 
 constexpr uint8_t TAW_KIND_AW = 0;
 constexpr uint8_t TAW_KIND_AWSEEK = 1;
 
 constexpr uint8_t TAW_PROFILE_INT_ORDER0 = 0;
-constexpr uint8_t TAW_PROFILE_F32_STRICT_MIX = 1; /* reserved */
+constexpr uint8_t TAW_PROFILE_F32_STRICT_MIX = 1;
+constexpr uint8_t TAW_PROFILE_CALIBRATED_MIX = 6; /* experiment: profile 1 + calibration */
+constexpr uint8_t TAW_PROFILE_ENTROPY_GATE = 11;   /* experimental gate */
+constexpr uint8_t TAW_PROFILE_HNET_BOUNDARY = 14;  /* experimental boundary mixer */
 
 constexpr uint8_t TAW_QUANT_NONE = 0;
 constexpr uint8_t TAW_QUANT_F16 = 1;

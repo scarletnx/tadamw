@@ -19,7 +19,9 @@
 enum {
 	P1_NCM = 12,     /* context models (each gives two inputs) */
 	P1_NCTX = 25,    /* context-model inputs: 2 per model + match */
-	P1_F = 26,       /* mixer inputs: P1_NCTX + bias */
+	P1_F = 26,       /* mixer inputs in profile 1: P1_NCTX + bias */
+	P1_F_HNET = 27,  /* profile 14: profile 1 plus the boundary input */
+	P1_FMAX = 27,    /* widest mixer row built here */
 	P1_NHASH = 10,   /* hashed context models (all but o0, o1) */
 	P1_HMAX = 32,    /* max hidden units */
 	P1_MODEL_HEAD = 8,
@@ -28,6 +30,32 @@ enum {
 	P1_LIMIT_HMAP = 1023, /* history map count limit */
 	P1_MAXVERIFY = 32,
 };
+
+/* Arithmetic profile 6 (CALIBRATED_MIX): the profile-1 mixer followed by a
+ * handful of fitted integer calibration parameters. The 8-byte calibration
+ * extension sits between the profile-1 head and the weight payload.
+ *
+ *   off 8..9:   temp (u16 LE, Q8 multiplier, 64..512)
+ *   off 10..11: bias (i16 LE, stretch units, -1024..1024)
+ *   off 12..14: w0, w1, w2 (u8, 0..15, sum != 0) APM mix weights
+ *   off 15:     reserved, must be 0
+ */
+enum {
+	P6_CAL_EXT = 8,
+	P6_MODEL_HEAD = P1_MODEL_HEAD + P6_CAL_EXT,
+	P6_TEMP_MIN = 64, P6_TEMP_MAX = 512,
+	P6_BIAS_MAX = 1024,
+	P6_W_MAX = 15,
+};
+
+typedef struct {
+	uint16_t temp;  /* Q8 multiplier of the stretch-domain logit */
+	int16_t bias;   /* stretch units added after scaling */
+	uint8_t w0, w1, w2; /* weights of p_mix, APM1, APM2 */
+} p6_cal;
+
+/* The identity calibration: profile 1's arithmetic exactly. */
+#define P6_CAL_IDENTITY ((p6_cal){ .temp = 256, .bias = 0, .w0 = 2, .w1 = 1, .w2 = 1 })
 
 /* Context models; model k gives inputs k (direct) and P1_NCM + k (history).
  * The S models are sparse: S23 = bytes 2 and 3 back, and so on. */
@@ -161,34 +189,66 @@ static inline uint32_t p1_sel_value(unsigned sel, const p1_sel_ctx *sc)
 
 /* ---- the frozen network -------------------------------------------------- */
 
-/* Mixer input vectors are P1_XPAD floats: x[0..P1_F-1] then zeros, so
- * that SIMD kernels may read whole vectors. */
+/* Mixer input vectors are P1_XPAD floats: x[0..f-1] then zeros, so that
+ * SIMD kernels may read whole vectors. f is P1_F (profile 1) or P1_F_HNET
+ * (profile 14). */
 enum { P1_XPAD = 32 };
 
 typedef struct p1_net p1_net;
 struct p1_net {
 	p1_shape s;
+	unsigned f;    /* mixer inputs: P1_F or P1_F_HNET */
 	unsigned hpad; /* hidden rounded up to 8 */
 	unsigned w2s;  /* output-layer row stride: hpad, or P1_XPAD if H = 0 */
-	float *w1;     /* [S1][P1_F][hpad], transposed, zero padded */
+	float *w1;     /* [S1][f][hpad], transposed, zero padded */
 	float *w2;     /* [S2][w2s] zero padded; no bias when H > 0 */
 	float *b2;     /* [S2] output bias when H > 0 */
+	/* Calibration (profile 6). Profile 1 nets get the identity values. */
+	p6_cal cal;
 	/* z before the bias: dot4 over the output layer (format.md §2.2.8) */
 	float (*mix)(const p1_net *n, const float *x, const float *w1,
 	    const float *w2);
 };
 
-/* Bytes the weight payload needs for a shape and quant format. */
-uint64_t p1_weights_size(const p1_shape *s, uint8_t quant);
+/* Bytes the weight payload needs for a shape, quant format and row width. */
+uint64_t p1_weights_size_ex(const p1_shape *s, uint8_t quant, unsigned f);
+static inline uint64_t p1_weights_size(const p1_shape *s, uint8_t quant)
+{
+	return p1_weights_size_ex(s, quant, P1_F);
+}
 bool p1_quant_supported(uint8_t quant);
 
-/* Parse a model section (header + weights) and dequantize it. */
-taw_status p1_net_load(p1_net *n, uint8_t quant, const uint8_t *model,
-    size_t size);
+/* Parse a model section (header + weights) and dequantize it. The _ex form
+ * chooses the mixer width; profile 1 uses p1_net_load (f = P1_F). */
+taw_status p1_net_load_ex(p1_net *n, uint8_t quant, const uint8_t *model,
+    size_t size, unsigned f);
+static inline taw_status p1_net_load(p1_net *n, uint8_t quant,
+    const uint8_t *model, size_t size)
+{
+	return p1_net_load_ex(n, quant, model, size, P1_F);
+}
 void p1_net_free(p1_net *n);
 /* Stretch-domain output, [-2047, 2047]. x has P1_XPAD entries,
- * x[P1_IN_BIAS] = 1 and x[P1_F..] = 0. */
+ * x[P1_IN_BIAS] = 1 and x[f..] = 0, where f = n->f (26 or 27). */
 int32_t p1_net_eval(const p1_net *n, const float *x, const p1_sel_ctx *sc);
+
+/* ---- profile 6: learned probability calibration --------------------------- */
+
+/* Apply the fitted temperature and bias to stretch-domain t (integer only).
+ * The result is clamped to [-2047, 2047] and can be passed to p1_squash. */
+int32_t p6_cal_t(const p6_cal *cal, int32_t t);
+/* Size of a profile 6 model section (head + extension + weights). */
+uint64_t p6_model_size(const p1_shape *s, uint8_t quant);
+/* Write / parse the 16-byte profile 6 head (the first 8 bytes are the
+ * profile 1 head, so p1_head_parse works on them unchanged). */
+void p6_head_write(uint8_t out[P6_MODEL_HEAD], const p1_shape *s,
+    const p6_cal *cal);
+taw_status p6_head_parse(const uint8_t *p, size_t n, p1_shape *s,
+    p6_cal *cal);
+/* Load a profile 6 model section. The weight payload uses the profile 1
+ * encoding; the calibration extension is parsed before the weights. */
+taw_status p6_net_load(p1_net *n, uint8_t quant, const uint8_t *model,
+    size_t size);
 
 /* The mixer kernels; all produce identical bits. */
 float p1_mix_scalar(const p1_net *n, const float *x, const float *w1,
@@ -209,10 +269,42 @@ void p1_isa_force(int isa);
 /* The ISA that kernels picked now should use (forced or best). */
 p1_isa p1_isa_current(void);
 
+/* ---- profile 11: entropy-adaptive confidence gate ------------------------
+ * Profile 11 is profile 1's context models, frozen MLP and APM stages plus a
+ * four-byte gate appended to the model section (docs/format.md §2.11, §5.11).
+ * The gate interpolates the MLP's probability with the raw mixture of the 25
+ * stretched context estimates, with a weight driven by their disagreement.
+ * All of it is integer arithmetic; fit.c and the decoder share these helpers.
+ */
+
+enum {
+	P11_GATE_SIZE = 4,
+	P11_GATE_SHIFT = 6,   /* fixed: gate_b * mad is floor-divided by 2^6 */
+	P11_GATE_A_MIN = -256, P11_GATE_A_MAX = 512,
+	P11_GATE_B_MIN = -2048, P11_GATE_B_MAX = 2048,
+};
+
+typedef struct {
+	int16_t a, b;
+} p11_gate;
+
+/* Confidence features from the 25 stretched inputs (st[i] in 1/256 units):
+ * mean = round-to-nearest(st[i] sum / 25), mad = mean |st[i] - mean|. */
+void p11_features(const int16_t st[P1_NCTX], int32_t *mean, int32_t *mad);
+/* p = ((256 - w) * p_mlp + w * p_ctx + 128) >> 8, w from the gate and mad. */
+uint32_t p11_gate_p(uint32_t p_mlp, uint32_t p_ctx, int32_t mad,
+    const p11_gate *g);
+
+/* Parse/write the four-byte little-endian gate tail (signed int16 a, b). */
+taw_status p11_gate_parse(const uint8_t *p, size_t n, p11_gate *g);
+void p11_gate_write(uint8_t out[P11_GATE_SIZE], const p11_gate *g);
+
 /* ---- the per-bit loop ------------------------------------------------------- */
 
 /* Profile 1 state. After the mixer, two adaptive APM (SSE) stages refine
- * the probability in the contexts c0 and c1:c0 (format.md §2.2.9). */
+ * the probability in the contexts c0 and c1:c0 (format.md §2.2.9).
+ * With `gated` set (profile 11) both the generic loop in predictor.c and the
+ * fused AVX2 loop insert the entropy gate; the golden vectors pin them. */
 enum { P1_APM_RATE = 6 };
 struct taw_p1 {
 	p1_ctx ctx;
@@ -220,6 +312,9 @@ struct taw_p1 {
 	uint16_t apm1[256 * 33];
 	uint16_t *apm2;    /* [65536 * 33] */
 	uint32_t a1, a2;   /* entries to update after the bit */
+	bool calibrated;  /* profile 6: apply cal and learned APM weights */
+	p11_gate gate;    /* profile 11 only */
+	bool gated;       /* profile 11: interpolate MLP with raw mixture */
 };
 
 /* After the context-model counters of a bit are updated: the match
@@ -231,6 +326,26 @@ void p1_ctx_tail(p1_ctx *c, int bit);
 #define P1_BOUNDARY_BITS 0x198u
 void p1_ctx_boundary(p1_ctx *c, int bit);
 extern const uint16_t p1_squash_knot[33];
+
+/* ---- APM stages (shared by profile 1 and profile 14) --------------------- */
+
+/* Tables and the one-entry update of format.md §2.2.9. Keeping one copy
+ * guarantees the two profiles refine probabilities identically. */
+void p1_apm_reset(uint16_t apm1[256 * 33], uint16_t *apm2);
+static inline uint32_t p1_apm_p(const uint16_t *t, size_t row, int32_t s12,
+    uint32_t *upd)
+{
+	uint32_t u = (uint32_t)(s12 + 2048);
+	uint32_t lo = u >> 7, w = u & 127;
+	const uint16_t *r = t + row * 33;
+	*upd = (uint32_t)(row * 33) + lo + (w >> 6);
+	return (r[lo] * (128 - w) + r[lo + 1] * w) >> 7;
+}
+static inline void p1_apm_update(uint16_t *e, int bit)
+{
+	*e = bit ? (uint16_t)(*e + ((65535u - *e) >> P1_APM_RATE))
+		 : (uint16_t)(*e - (*e >> P1_APM_RATE));
+}
 
 /* The whole per-bit loop with the AVX2 kernels fused (p1_run_avx2.c):
  * the same bits as the generic loop in predictor.c. */
