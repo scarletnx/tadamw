@@ -14,6 +14,13 @@ taw_test(rc)
 taw_test(aw)
 taw_test(awseek)
 taw_test(p1)
+taw_test(hnet)
+# One canonical harness (tests/fitgolden.h owns the single baseline table).
+# One arm target per new profile, all with unique names.
+taw_test(fitgolden)
+taw_test(cal_fit)
+taw_test(gate_fit)
+taw_test(hnet_fit)
 taw_test(quant)
 taw_test(fit_opt) # shared Newton-Schulz polynomial, bit-exactness oracle
 taw_test(gpu)
@@ -21,8 +28,6 @@ set_tests_properties(gpu PROPERTIES SKIP_RETURN_CODE 77)
 
 # Dynamic .awseek container tests.
 taw_test(dynfit)
-
-taw_test(fitgolden)
 
 # Knob-off archive bytes for every optimizer profile, from the foundation.
 add_test(NAME cli_fit_golden
@@ -56,8 +61,26 @@ add_test(NAME cli_fit_ema_seek
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_fit_ema_seek.cmake)
 set_tests_properties(cli_fit_ema_seek PROPERTIES ENVIRONMENT "TAW_FIT_AVG=ema999")
 
+# The seek path calls taw_model_fit_source directly; cover every predictor.
+foreach(arm mix cal gate)
+  add_test(NAME cli_fit_${arm}_seek
+           COMMAND ${CMAKE_COMMAND} -DTAW=$<TARGET_FILE:taw_cli>
+                   "-DSOURCES=${PROJECT_SOURCE_DIR}/docs/format.md|${PROJECT_SOURCE_DIR}/docs/design.md"
+                   -DWORK=${CMAKE_CURRENT_BINARY_DIR}/fit_${arm}_work
+                   -DPRED=${arm}
+                   -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_fit_arms.cmake)
+endforeach()
+
 add_test(NAME cli_version COMMAND taw_cli --version)
 set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION "^taw [0-9]+\\.[0-9]+\\.[0-9]+")
+
+# Profile 14 reaches taw_model_fit_source through the awseek encoder too.
+add_test(NAME cli_fit_hnet_seek
+         COMMAND ${CMAKE_COMMAND} -DTAW=$<TARGET_FILE:taw_cli>
+                 -DWORK=${CMAKE_CURRENT_BINARY_DIR}/fit_hnet_work
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_fit_hnet_seek.cmake)
+set_tests_properties(cli_fit_hnet_seek PROPERTIES ENVIRONMENT
+                     "TAW_MALT=off;TAW_MALTER=0;TAW_HYBRID=off")
 
 add_test(NAME cli_roundtrip
          COMMAND ${CMAKE_COMMAND} -DTAW=$<TARGET_FILE:taw_cli>

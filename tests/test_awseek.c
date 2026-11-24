@@ -26,7 +26,8 @@ static void *compress_seek_p(const uint8_t *src, size_t n, uint32_t bs,
     taw_predictor pred, size_t *arc_n)
 {
 	taw_params p = {.seekable = true, .block_size = bs, .predictor = pred,
-		.level = pred == TAW_PREDICTOR_MIX ? 1 : 0};
+		.level = pred == TAW_PREDICTOR_MIX || pred == TAW_PREDICTOR_GATE
+			? 1 : 0};
 	void *arc;
 	REQUIRE(taw_compress(src, n, &p, &arc, arc_n) == TAW_OK);
 	return arc;
@@ -676,6 +677,7 @@ int main(void)
 		}
 		td_fill(src, N, TD_TEXT, 3);
 		roundtrip_p(src, N, 4096, TAW_PREDICTOR_AUTO);
+		roundtrip_p(src, N, 1u << 14, TAW_PREDICTOR_GATE);
 		free(src);
 	}
 

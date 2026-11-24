@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Profile 1's per-bit loop with the AVX2 kernels fused (built with -mavx2
- * -mf16c, used only after a CPUID check). It computes exactly what the
- * generic loop (predictor.c over p1_ctx.c, p1_net.c) computes, in one
+/* Profile 1's (and profile 11's) per-bit loop with the AVX2 kernels fused
+ * (built with -mavx2 -mf16c, used only after a CPUID check). It computes
+ * exactly what the generic loop (predictor.c over p1_ctx.c, p1_net.c) does, in one
  * function: the slot values and history-map entries a bit reads stay in
  * registers until its update, the mixer and the squash are inline, and
  * the selectors are read once. Only nibble and byte boundaries call out
@@ -86,6 +86,16 @@ static inline void apm_update(uint16_t *e, int bit)
 		 : (uint16_t)(*e - (*e >> P1_APM_RATE));
 }
 
+/* Sum of eight signed 32-bit lanes (no overflow: |st| <= 2047). */
+static inline int hsum8(__m256i v)
+{
+	__m128i s = _mm_add_epi32(_mm256_castsi256_si128(v),
+	    _mm256_extracti128_si256(v, 1));
+	s = _mm_hadd_epi32(s, s);
+	s = _mm_hadd_epi32(s, s);
+	return _mm_cvtsi128_si32(s);
+}
+
 enum { RUN_ENC, RUN_DEC, RUN_SKIP };
 
 static inline __attribute__((always_inline)) void run(struct taw_p1 *m,
@@ -101,6 +111,7 @@ static inline __attribute__((always_inline)) void run(struct taw_p1 *m,
 	const __m256i sinit = _mm256_set1_epi32((int)P1_SLOT_INIT);
 	const __m256i hinit = _mm256_set1_epi32((int)P1_HM_INIT);
 	const __m256i ff = _mm256_set1_epi32(0xFF);
+	const __m256i low4 = _mm256_setr_epi32(-1, -1, -1, -1, 0, 0, 0, 0);
 	const __m256 inv = _mm256_set1_ps(1.0f / 256.0f);
 	const __m256i kb0 = _mm256_load_si256((const __m256i *)kbase16);
 	const __m256i kb1 = _mm256_load_si256((const __m256i *)(kbase16 + 8));
@@ -199,7 +210,41 @@ static inline __attribute__((always_inline)) void run(struct taw_p1 *m,
 				z = mix_linear8(x, w2);
 			}
 			z = z > lim ? lim : z < -lim ? -lim : z;
-			const uint32_t p = squash((int32_t)(z * 256.0f));
+			uint32_t p = squash((int32_t)(z * 256.0f));
+
+			/* ---- profile 11 entropy gate ----
+			 * Deliberate duplication of p11_features/p11_gate_p
+			 * (p1_ctx.c): the fused loop keeps the 24 context
+			 * estimates in registers as integers, so reusing the
+			 * scalar helpers would spill them to memory and lose
+			 * most of the fused loop's speed. The duplication is
+			 * pinned by the profile-11 golden vectors, which compare
+			 * this path with the generic p1_p16 path bit-for-bit.
+			 * Only the low four lanes of d1/h1 are real models (the
+			 * others are padding); the 25th estimate is the match
+			 * input, if active. */
+			if (m->gated) {
+				const int32_t st24 = c->mbit >= 0
+				    ? p1_stretch_tab[(c->sm[c->msi] ^
+					    P1_SLOT_INIT) >> 20] : 0;
+				const int sum = hsum8(d0) + hsum8(_mm256_and_si256(d1, low4)) +
+				    hsum8(h0) + hsum8(_mm256_and_si256(h1, low4)) + st24;
+				const int mean = (sum >= 0 ? sum + 12 : sum - 12) / 25;
+				const __m256i meanv = _mm256_set1_epi32(mean);
+				const __m256i ad0 = _mm256_abs_epi32(
+				    _mm256_sub_epi32(d0, meanv));
+				const __m256i ad1 = _mm256_and_si256(
+				    _mm256_abs_epi32(_mm256_sub_epi32(d1, meanv)), low4);
+				const __m256i ah0 = _mm256_abs_epi32(
+				    _mm256_sub_epi32(h0, meanv));
+				const __m256i ah1 = _mm256_and_si256(
+				    _mm256_abs_epi32(_mm256_sub_epi32(h1, meanv)), low4);
+				const int dev = hsum8(ad0) + hsum8(ad1) + hsum8(ah0) +
+				    hsum8(ah1) + (st24 - mean < 0 ? mean - st24
+							  : st24 - mean);
+				const int mad = (dev + 12) / 25;
+				p = p11_gate_p(p, squash(mean), mad, &m->gate);
+			}
 
 			/* ---- APM and the coded probability ---- */
 			const uint32_t u = (uint32_t)(p1_stretch_tab[p >> 4] + 2048);

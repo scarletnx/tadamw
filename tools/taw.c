@@ -35,9 +35,9 @@ static void usage(FILE *f)
 	    "      -p auto|order0|mix|cal|gate|hnet\n"
 	    "                       predictor (default auto: the fitted mixer\n"
 	    "                       if it beats order0). cal/gate/hnet are the\n"
-	    "                       allocated predictor slots 6/11/14; they are\n"
-	    "                       TAW_E_ARG until the owning profile lands.\n"
-	    "                       Values 3..5, 7..10 and 12..13 are void.\n"
+	    "                       predictor slots 6/11/14 and select the\n"
+	    "                       three experimental arithmetic profiles.\n"
+	    "                       Value 3 is void; 4/5/7..10/12/13 are refused.\n"
 	    "      -w auto|f16|q8|q4|q2|fp8|nvfp4|iq8|iq4|iq2\n"
 	    "                       mixer weight format (default auto)\n"
 	    "      -j N             worker threads (default 1)\n"
@@ -145,7 +145,7 @@ static bool parse_choice(const char *s, const char *const *names,
 	return false;
 }
 
-/* Predictor values are NOT array indices: R-4 allocates them to equal the
+/* Predictor values are NOT array indices: the registry allocates them equal to the
  * arithmetic profile ID. A sparse name table keeps the CLI and the public
  * enum in agreement; value 3 has no name. */
 static const struct {
@@ -198,7 +198,7 @@ static int cmd_compress(int argc, char **argv)
 	taw_params p = {0};
 	int i = 0;
 	for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
-		uint64_t v;
+		uint64_t v = 0;
 		if (strcmp(argv[i], "-s") == 0) {
 			p.seekable = true;
 		} else if (strcmp(argv[i], "-D") == 0) {

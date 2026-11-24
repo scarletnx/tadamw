@@ -8,12 +8,15 @@ library (`libtadamw`) plus command-line tools. Two variants:
 - `.awseek`: fixed-size blocks plus a seek table for random access, and
   optionally a directory of named files
 
-Status: working draft. The container, range coder, seeking and both
-arithmetic profiles work: profile 0 is an integer order-0 placeholder, and
-profile 1 (`F32_STRICT_MIX`) is the fitted mixer. Adaptive integer
-context models feed a small MLP that the encoder fits with AdamW and
-stores as F16 or Q8. Every SIMD path (AVX2/F16C, AVX-512, SSE4.2 CRC) has a
-generic one beside it that produces identical bits. See `docs/`.
+Status: working draft. The container, range coder, seeking and all four
+arithmetic profiles work: profile 0 is an integer order-0 placeholder,
+profile 1 (`F32_STRICT_MIX`) is the fitted mixer, and the experimental
+profiles 6 (`CALIBRATED_MIX`), 11 (`ENTROPY_GATE`) and 14 (`HNET_BOUNDARY`)
+add fitted probability calibration, an entropy-adaptive confidence gate, and
+one integer H-Net-style boundary input respectively. Adaptive integer context
+models feed a small MLP that the encoder fits with AdamW and stores as F16, Q8
+or the newer weight formats. Every SIMD path (AVX2/F16C, AVX-512, SSE4.2 CRC)
+has a generic one beside it that produces identical bits. See `docs/`.
 
 ## Build
 
@@ -65,6 +68,9 @@ declared. A shared library exports the `taw_*` API alone.
 ```sh
 taw c [-l 1..9] in out.aw              # stream
 taw c -p mix -w q8 in out.aw           # force the mixer, Q8 weights
+taw c -p cal in out.aw                 # opt into experimental profile 6
+taw c -p gate in out.aw                # profile 11: entropy-adaptive gate
+taw c -p hnet in out.aw                # profile 14: + integer boundary input
 taw c -l 9 -g on in out.aw             # fit on a GPU (-g auto: if there is one)
 taw c [-B block_size] [-j N] in out.awseek   # seekable (or -s), N threads
 taw d archive out

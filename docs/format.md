@@ -1,9 +1,11 @@
 # tar_aw container format, version 1
 
-Status: draft. Normative for everything implemented (profiles 0 and 1, and
-the awseek variable-length-block container extension in §7.2); reserved values
-are listed so that decoders can refuse them. `tests/test_p1.c` pins profile 1
-with golden vectors: a change that breaks them changes the format.
+Status: draft. Normative for profiles 0, 1 and the experimental profiles 6
+(`CALIBRATED_MIX`), 11 (`ENTROPY_GATE`) and 14 (`HNET_BOUNDARY`), and for the
+awseek variable-length-block container extension (§7.2); reserved and denied
+values are listed so that decoders can refuse them. `tests/test_p1.c` pins
+profiles 1/6/11 and `tests/test_hnet.c` pins profile 14 with golden vectors:
+a change that breaks them changes the format.
 
 All integers are unsigned and little-endian unless stated otherwise.
 `crc32c` is CRC-32C (Castagnoli, reflected polynomial `0x82F63B78`, init
@@ -26,14 +28,11 @@ Section numbers follow the rule *section number = profile ID*; profiles
 |----------|------|----------------------|---------------------|
 | profile 0 | `INT_ORDER0` | §2.1, §5 (intro note) | implemented |
 | profile 1 | `F32_STRICT_MIX` | §2.2, §5.1 | implemented, golden-pinned |
-| profile 6 | `CALIBRATED_MIX` | §2.6, §5.6 | reserved; decoder refuses |
-| profile 11 | `ENTROPY_GATE` | §2.11, §5.11 | reserved; decoder refuses |
-| profile 14 | `HNET_BOUNDARY` | §2.14, §5.14 | reserved; decoder refuses |
+| profile 6 | `CALIBRATED_MIX` | §2.6, §5.6 | experimental: decoder implemented, golden-pinned |
+| profile 11 | `ENTROPY_GATE` | §2.11, §5.11 | experimental: decoder implemented, golden-pinned |
+| profile 14 | `HNET_BOUNDARY` | §2.14, §5.14 | experimental: decoder implemented, golden-pinned |
 | awseek flag bit 1 | variable-length blocks (container only) | §7.2 | implemented; off by default |
-| profile 3, 7 | `SOFT_GATED`, `SOFT_GATED_CAL` | — | reserved; decoder refuses |
-| profile 8 | `PAQ_MIX` | — | reserved; decoder refuses |
-| profile 10 | `F32_CHAINED_MIX` | — | reserved; decoder refuses |
-| profile 12 | `MDL_TREE` | — | reserved; decoder refuses |
+| profiles 2..5, 7..10, 12..13, 15..255 | — | — | reserved: refuse |
 
 Reserved IDs are refused by decoders. No quant ID is added here: quant ids
 `5..11` (`Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4`, `IQ2`) stay exactly as
@@ -101,15 +100,16 @@ identical probabilities for every bit.
 |----|-----------------|---------------|--------|
 | 0  | `INT_ORDER0`    | empty (`model_size = 0`, `quant = 0`) | implemented, placeholder |
 | 1  | `F32_STRICT_MIX`| mixer shape and weights, §5.1; quant `F16`, `Q8`, `Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4` or `IQ2` | implemented |
-| 6  | `CALIBRATED_MIX` | §5.6 | reserved; decoder refuses |
-| 11 | `ENTROPY_GATE` | §5.11 | reserved; decoder refuses |
-| 14 | `HNET_BOUNDARY` | §5.14 | reserved; decoder refuses |
+| 6  | `CALIBRATED_MIX` | profile 1 model + 8 calibration bytes, §5.6; same quant formats | experimental |
+| 11 | `ENTROPY_GATE` | profile 1 model + 4-byte gate tail, §5.11 | experimental |
+| 14 | `HNET_BOUNDARY` | profile 1 plus one integer boundary input, §2.14; model §5.14 | experimental |
 | 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 15..255 | — | — | reserved: refuse |
 
-This is the only profile table. IDs `6`, `11` and `14` are named in the
-allocation registry but are not implemented on this base, so a decoder here
-refuses them. IDs `3`, `7`, `8`, `10` and `12` are reserved (see the allocation
-registry) and MUST NOT be treated as free. §2.3 and §5.2 are sealed.
+This is the only profile table; IDs 6, 11 and 14 are allocated by the central
+registry above and are therefore not in the reserved range. All three have
+normative text here (§2.6/§5.6, §2.11/§5.11, §2.14/§5.14) and decoders for all
+three are implemented. IDs 3, 7, 8, 10 and 12 are reserved and MUST NOT be
+reclaimed as free. §2.3 and §5.2 are sealed.
 
 ### 2.1 Profile 0: `INT_ORDER0`
 
@@ -371,19 +371,151 @@ use §2.6, §2.11 and §2.14.
 
 ### 2.6 Profile 6: `CALIBRATED_MIX`
 
-Reserved; `arith_profile = 6` is refused. Predictor slot
-`TAW_PREDICTOR_CALIBRATED = 6` uses the CLI token `-p cal`.
+Predictor slot `TAW_PREDICTOR_CALIBRATED = 6` / CLI `-p cal` is allocated.
+The generic per-bit loop is used; its context and mixer kernels still use
+AVX2/AVX-512 when available, and all ISA paths produce the same calibrated
+probabilities.
+
+Exactly the profile 1 per-bit sequence (§2.2), with two integer-only changes.
+
+1. **Logit calibration.** Let `t` be profile 1's stretch-domain mixer output
+   (§2.2.8, `[-2047, 2047]`). With the fitted `temp` (Q8 multiplier) and
+   `bias` (stretch units):
+
+   ```
+   q = temp * t                            (signed, |q| < 2^21)
+   s = q >= 0 ? (q + 128) / 256 : (q - 128) / 256   (integer division,
+                                                     truncated toward zero)
+   t' = clamp(s + bias, -2047, 2047)
+   p_mix = squash(t')
+   ```
+
+   The identity calibration is `temp = 256`, `bias = 0`; it reproduces
+   profile 1's `t` exactly. All later uses of `p_mix` (APM bin lookup, APM
+   update) use the calibrated value.
+
+2. **Learned APM mixture.** Let `q1`, `q2` be the two interpolated APM outputs
+   (§2.2.9), and `w0`, `w1`, `w2` the fitted 4-bit weights. Then the coded
+   probability is
+
+   ```
+   p = (w0 * p_mix + w1 * q1 + w2 * q2) / (w0 + w1 + w2)   (integer division)
+   ```
+
+   The sum is always at least 1, and the numerator is below 2^22. The
+   identity weights are `(2, 1, 1)`; they differ from profile 1 only by
+   truncation instead of `(2*p_mix + q1 + q2) >> 2`. An identity-calibration
+   profile 6 file therefore codes with the same bits as profile 1 (the model
+   section is 8 bytes longer).
+
+Everything else — contexts, hashing, MLP, `squash`, APM tables and their
+updates — is byte-for-byte profile 1. A change to those changes both profiles
+and requires new profile ids; the calibration parameters are the only
+profile-6 degrees of freedom.
 
 ### 2.11 Profile 11: `ENTROPY_GATE`
 
-Reserved; `arith_profile = 11` is refused. Predictor slot
-`TAW_PREDICTOR_GATE = 11` uses the CLI token `-p gate`.
+Profile 11 is profile 1 with an entropy-adaptive confidence gate inserted
+between the mixer and the APM stages. All of §2.2 applies unchanged, except
+that step 2 of §2.2.10 uses `p_gate` below in place of `p_mix`; the APM stages
+of §2.2.9 then refine `p_gate` exactly as they refined `p_mix`.
+
+The frozen MLP still produces `p_mlp = squash(t)` (§2.2.8). Let `st[0..24]` be
+the integer stretch values that produced its inputs (`x[i] = st[i]/256` is
+exact in binary32). From them compute, in int32:
+
+```
+sum  = Σ(i = 0..24) st[i]                      [-51175, 51175]
+mean = (sum >= 0 ? (sum + 12) / 25 : (sum - 12) / 25)   round, ties away from 0
+dev  = Σ(i = 0..24) |st[i] - mean|
+mad  = (dev + 12) / 25                         [0, 4094]
+p_ctx = squash(mean)                           mean is in [-2047, 2047]
+```
+
+The four-byte gate tail of the model section (§5.11) holds two signed
+little-endian int16 parameters: `a` in `[-256, 512]` and `b` in
+`[-2048, 2048]`. With the fixed shift `S = 6`:
+
+```
+prod   = b * mad                               (int32)
+q      = floor(prod / 64)                      (floor, not truncation)
+w      = clamp(a + q, 0, 256)
+p_gate = ((256 - w) * p_mlp + w * p_ctx + 128) >> 8    [22, 65514]
+```
+
+The APM stages use `s12 = stretch[p_gate >> 4]` and update their entries as in
+§2.2.9. With `a = b = 0`, `w = 0` and profile 11 is bit-identical to profile 1.
+
+`mad` measures disagreement among the context estimates. Parameters are
+fitted by the encoder and remain frozen while coding.
 
 ### 2.14 Profile 14: `HNET_BOUNDARY`
 
-Reserved; `arith_profile = 14` is refused. Predictor slot
-`TAW_PREDICTOR_HNET = 14` uses the CLI token `-p hnet`. Value 3 is void, and
-`3..5`, `7..10` and `12..13` are refused (see the predictor enum above).
+This profile is profile 1 with one extra mixer input. All 12 context models,
+their hashes and counters, the selectors, the `dot4` order and clamps, the
+integer squash, both APM stages, the range coder and the model-section head
+and row formats are exactly those of §2.2 and §5.1. Only the mixer row width
+and the per-bit inputs change. There is no libm and no new learned weights
+beyond the wider rows.
+
+#### 2.14.1 Sampled estimates and the boundary signal
+
+Let the four sampled input indices be `P = [0, 1, 7, 24]`: the direct o0 and
+o1 estimates, the direct word estimate and the match estimate of §2.2.3.
+
+A sample is taken once per byte, on the inputs of `bitpos = 7` (the last bit
+of a byte, just before the byte completes), **before** that bit is coded. The
+new value of `b` is used for that bit and is held until the next byte's
+`bitpos = 7`, i.e. through the first seven bits of the next byte. If `x[i]`
+are the profile-1 inputs of that bit, the integer stretch values are
+`u[j] = x[P[j]] * 256`, which is exact (binary32 division and multiplication
+by a power of two: `x[i] = stretch[i]/256`).
+
+With `prev[0..3]` the previous sample (initially all zero, see §2.14.3):
+
+```
+d[j] = abs(u[j] - prev[j])                  (non-negative, <= 4094)
+s    = d[0] + d[1] + d[2] + d[3]            (0..16376)
+b    = min(s, 16376)                        (14-bit saturating; no wrap)
+prev = u
+```
+
+`b` is a non-negative integer in stretch units (1/256). Clamping at
+`4 * 2 * 2047` is the natural bound of four stretch differences; with the
+normative stretch range it never truncates a valid sum, but it fixes the
+register width.
+
+#### 2.14.2 Mixer and probability
+
+The mixer is §2.2.8 with `F = 27`: for `i = 0..24`, `x[i] = st[i]/256` as in
+profile 1, `x[25] = 1`, and
+
+```
+x[26] = b / 256     (exact in binary32; b <= 16376, so 0 <= x[26] <= 63.96875)
+```
+
+`x[27..31] = 0` (padding). Layer-1 weight rows are 27 weights in input order;
+single-layer (`hidden = 0`) output rows are also 27 weights. `dot4` keeps the
+same four partial sums, summation order and `(-2047/256, 2047/256)` clamp.
+The output then passes through §2.2.9's APM stages and probability formula
+unchanged.
+
+A profile-14 decoder uses the scalar mixer and the generic per-bit loop: the
+AVX2/AVX-512 mixer kernels and the fused AVX2 per-bit loop hardcode `F = 26`
+and MUST NOT be dispatched. The context-model kernels are shared.
+
+#### 2.14.3 State and encoder rules
+
+At the start of every coding unit (whole stream for `.aw`, every block for
+`.awseek`), in addition to §2.2.2: `prev[0..3] = 0`, `b = 0`. The first
+sample of a unit therefore compares its byte-7 state with the zero vector;
+before the first `bitpos = 7` of a unit, `x[26] = 0`. The state carries across
+`aw` chunks like profile 1's.
+
+The encoder's feature pass must compute `b` with exactly these rules (same
+indices, same sampling instant, same clamp, same per-unit reset) and store it
+with each training bit; the fit-pass and decoder signals MUST agree bit for
+bit (`tests/test_hnet.c`).
 
 ## 3. Quantization formats
 
@@ -457,8 +589,10 @@ Reading past the end of a segment yields `0` bytes. A probability outside
 ## 5. Model section
 
 `model_size` bytes immediately follow the header. Their layout belongs to
-the arithmetic profile (profile 0: empty). The model is fitted once over the
-whole input and is shared by every chunk or block.
+the arithmetic profile: profile 0 is empty; profile 1 is §5.1; profiles 6,
+11 and 14 are §5.6, §5.11 and §5.14 respectively. The allocation registry at
+the top of this document is the single section map. The model is fitted once
+over the whole input and is shared by every chunk or block.
 
 Constraint: `model_size <= floor(raw_size / 32)`. Encoders that cannot
 beat profile 0 inside that budget use profile 0.
@@ -535,16 +669,61 @@ MUST NOT be used for any other profile's model section. Other profiles use
 
 ### 5.6 Profile 6 model
 
-Reserved; a profile-6 model is refused on this base.
+Profile 6 shares the profile 1 weight payload and all of its `quant` formats
+(§3), but its head is 16 bytes: the profile 1 head (§5.1) followed by an
+8-byte calibration block.
+
+| off | size | field | valid range |
+|-----|------|-------|-------------|
+| 0   | 8    | profile 1 head | §5.1 (bytes 6 and 7 must still be `0`) |
+| 8   | 2    | `temp` (u16 LE) | `64..512` |
+| 10  | 2    | `bias` (i16 LE) | `-1024..1024` |
+| 12  | 1    | `w0` | `0..15` |
+| 13  | 1    | `w1` | `0..15` |
+| 14  | 1    | `w2` | `0..15`, not all three zero |
+| 15  | 1    | reserved | `0` |
+| 16  | …    | weight payload | §5.1, unchanged |
+
+`model_size` MUST equal `16` plus the profile 1 payload size for the chosen
+shape and `quant`. A decoder MUST refuse any field out of range, a non-zero
+reserved byte, or a size mismatch, using the same checks as §5.1. The row
+encodings and weight validation of §5.1 are unchanged.
 
 ### 5.11 Profile 11 model
 
-Reserved; a profile-11 model is refused on this base.
+The profile 11 model section is the §5.1 head and weight payload, followed
+immediately by a four-byte gate tail:
+
+| offset from tail | size | field | valid range |
+|------------------|------|-------|-------------|
+| 0 | 2 | `gate_a`, signed int16 LE | `-256..512` |
+| 2 | 2 | `gate_b`, signed int16 LE | `-2048..2048` |
+
+`model_size` MUST equal `8` plus the payload size (§5.1) plus `4` exactly.
+Profile 11 accepts every `quant` that profile 1 accepts (§3). A decoder MUST
+refuse an unsupported quant, an out-of-range gate parameter, a head/payload
+format error as in §5.1, or a size mismatch. The gate is fitted by the
+encoder and never changes while coding.
 
 ### 5.14 Profile 14 model
 
-Reserved; a profile-14 model is refused on this base. It reuses the §5.1 head
-and row encodings with row width 27 instead of 26.
+Profile 14 uses the §5.1 head and row encodings verbatim; this section only
+states the difference in row width (the profile id and section number match,
+as for §2.14). Layer-1 rows have `len = 27` inputs, and output rows have
+`len = 27` when `hidden = 0` (bias at index 25, boundary weight at 26);
+with `hidden > 0` output rows still have `H + 1` weights. There are no
+profile-specific head fields and no extra weights: `model_size = 8 +
+payload` with `len = 27`. All loader checks of §5.1 apply, plus:
+
+* the payload size must match the 27-wide rows for the header's `(profile,
+  quant)` — a 26-wide payload under profile 14 and a 27-wide payload under
+  profile 1 are both `TAW_E_FORMAT`;
+* the width comes from the header's `arith_profile`, never from the model
+  section, so the decoder cannot infer it from a field an attacker could
+  change without invalidating the model CRC.
+
+Predictor enum value 14 is allocated; value 3 is void. This is a profile ID,
+not a CLI array index.
 
 ## 6. aw body (kind 0)
 

@@ -33,6 +33,9 @@ drive a binary range coder (format.md §4).
 | profile 1 inputs | 12 adaptive integer context models (o0-o4, o6, word, 5 sparse), each giving a direct and an indirect (bit history) estimate, plus a match model: 25 inputs + bias |
 | profile 1 mixer | frozen MLP: one optional hidden layer (clamp ±8), weight sets picked by a selector context (the "table" part), fixed `dot4` summation order |
 | profile 1 output | integer squash, then two adaptive integer APM stages (c0, c1:c0) |
+| profile 6 (experimental) | profile 1 plus fitted temperature/bias on the stretch logit and a learned integer mix of the mixer and the two APM stages (format.md §2.6, §5.6) |
+| profile 11 (experimental) | profile 1 plus a fitted integer entropy-adaptive gate between the mixer and the APM stages (format.md §2.11, §5.11); it interpolates the MLP probability with the raw mixture of the 25 stretched estimates, weighted by their disagreement |
+| profile 14 (experimental) | H-Net-style boundary input: one integer feature from consecutive byte states, added to profile 1 as `x[26]`; no new weights or libm (format.md §2.14/§5.14) |
 
 ## Profile 1 in short
 
@@ -64,6 +67,47 @@ format.md §2.2 is normative; this is the reasoning.
   `s_r`. So scalar, AVX2 and AVX-512 agree by construction, and the tests
   check it. Four partial sums (rather than one running sum) shorten the
   add dependency chain without giving up exactness.
+
+## H-Net boundary profile (profile 14)
+
+[H-Net's dynamic chunking](https://arxiv.org/abs/2507.07955) decides where a
+token stream changes topic by scoring a boundary with the dissimilarity of
+adjacent context representations, `p_t = ½(1 − cos(q_t, k_{t−1}))`. The
+ingredients are a learned state, a cosine and a float; all three are
+unwelcome here: the decoder has only integer context state, must never call
+libm, and has no extra weights to spend. Profile 14 keeps the cheap part of
+the idea — *compare the context with itself one byte ago* — and expresses it
+with the state it already has.
+
+- **Representation.** Four stretched context estimates, already produced by
+  the 12 integer context models: `st[0]` (o0), `st[1]` (o1), `st[7]` (word),
+  `st[24]` (match). They are read as integers, not floats: `x[i] = st[i]/256`
+  is exact in binary32, so `x[i] * 256` recovers `st[i]` without rounding.
+- **Sampling.** Once per byte, on the inputs of the last bit (`bitpos = 7`),
+  just before the byte completes. At that point `c0` is nearly the whole byte,
+  so `st[0]` actually changes from byte to byte (sampling at `bitpos = 0`,
+  when `c0 = 1`, compares a constant). The
+  new value is held for that bit and the first seven bits of the next byte;
+  it therefore spans the transition between two adjacent bytes, like a
+  chunk boundary.
+- **Score.** `b = clamp(Σ_j |u_j − prev_j|, 0, 16376)` over the four inputs,
+  with `prev` the previous byte's sample. The bound is `4 × 2 × 2047`, the
+  natural width of a sum of stretch differences. `x[26] = b/256` is exact.
+  `prev` is a decoder-state vector, zeroed at each coding-unit reset.
+- **Cost.** Four subtractions, four absolute values, three adds and one clamp
+  per byte; no new table, no libm, no extra weight rows beyond making the
+  existing ones one weight wider. The fitter's feature pass calls the same
+  `phnet_boundary` routine, so the trained feature is the decoded one.
+- **What does not change.** The 12 context models and their APM stages, the
+  frozen mixer's `dot4` order and clamps, the squash and both APM stages, the
+  range coder, the head and all quant formats. Only `F` goes 26 → 27.
+
+The AVX2/AVX-512 mixer kernels unroll `F = 26` and the fused per-bit loop
+hardcodes the same width, so profile 14 uses the scalar mixer and the generic
+per-bit loop.
+
+`tests/test_hnet.c` pins the boundary sums, F16/Q8 golden archives, ISA
+parity, fit-pass/decoder feature parity and the wider-row loader checks.
 
 ## Decoder performance
 
@@ -539,6 +583,7 @@ The matching public API fields are `taw_params.dyn_blocks`,
 | `src/p1_run_avx2.c` | the fused AVX2 per-bit loop (encode, decode, skip) |
 | `src/p1_avx512.c` | AVX-512F mixer (used by `p1_net_eval`; the per-bit loop runs the fused AVX2 code) |
 | `src/p1_simd_out.h` | mixer pieces shared by the AVX2 and AVX-512 files |
+| `src/phnet.h`, `src/phnet.c` | profile 14: integer boundary signal and generic per-bit loop |
 | `src/half.h` | binary16 conversions |
 | `src/quant.c` | weight row formats: sizes, validated decoding, the encoder's quantizer |
 | `src/fit.c` | encoder: feature pass, candidates, AdamW, quantization, choice, CPU/GPU split |
@@ -551,6 +596,7 @@ The matching public API fields are `taw_params.dyn_blocks`,
 | `tools/taw.c` | CLI |
 | `tools/taw_nx.c` | XCI/NSP transcoder (docs/nx.md) |
 | `tools/hactool/` | hactool as ScarletNX carries it, plus `snx_hac_encrypt` (tadamw) |
+| `tests/test_hnet.c` | profile 14 golden vectors, boundary and fit-pass parity |
 | `tests/` | CTest executables + CLI roundtrip script |
 
 ## Open items

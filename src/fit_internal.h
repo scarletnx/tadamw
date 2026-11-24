@@ -13,6 +13,7 @@
  * context and the bit. */
 typedef struct {
 	int16_t st[P1_NCTX];
+	int16_t b; /* profile 14: boundary signal sampled at this byte's last bit (0 otherwise) */
 	uint8_t c0, c1, msel, bit;
 } sample;
 
@@ -20,6 +21,7 @@ typedef struct {
  * model section stores them. Named so fit_opt.h can take an opaque pointer. */
 typedef struct tnet {
 	p1_shape s;
+	unsigned f;               /* mixer width: P1_F or P1_F_HNET */
 	size_t s1, s2, row1, row2; /* sets, params per set */
 	size_t n1, n2;             /* params per layer */
 	float *w, *m, *v, *g;      /* [n1 + n2] each */
@@ -29,7 +31,7 @@ typedef struct tnet {
 	/* MALT/MALTER W1 state: row/column diagonal preconditioner EMAs and the
 	 * scalar (MALTER) second moment. Only touched when TAW_MALT is enabled,
 	 * but allocated unconditionally so the shipped fitter is untouched. */
-	float *malt_l, *malt_r;    /* [s1*H], [s1*P1_F] */
+	float *malt_l, *malt_r;    /* [s1*H], [s1*f] */
 	float *malt_nu;            /* [s1] */
 	/* NAMO / NAMO-D W1 state: scalar second moment per set, column second
 	 * moments per set, plus the shared shrink-gate sign EMA per W1 weight. */
