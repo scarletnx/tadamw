@@ -4,6 +4,7 @@
  * pre/post-processing that was already in fit.c. The FP expression order is
  * preserved character-for-character so shipped profiles stay bit-identical. */
 #include "fit_opt.h"
+#include "p1.h" /* P1_HMAX: per-set column-second-moment stride */
 
 /* x^{-1/8} without libm; x > 0 thanks to the damping term. */
 static inline float inv_root8(float x)
@@ -233,4 +234,88 @@ float ns_score(const optcfg *o, const float *g, unsigned rows, unsigned cols)
 		xn += (double)x[at] * x[at];
 	}
 	return xn > 0.0 ? (float)(dot / (double)fsqrt((float)xn)) : 0.0f;
+}
+/* NAMO / NAMO-D (arXiv:2602.17080v2, Algorithms 1 and 2) on a row-major
+ * rows x cols W1 matrix. The first moment m[] is the usual Muon momentum
+ * (m = mu1*m + g, with g already divided by the batch size), i.e. the paper's
+ * biased M_t / (1-mu1). Orthogonalization is scale invariant, so O_t is the
+ * paper's Orth(M_t) up to that constant; the bias-corrected scale mu1^t and
+ * eps_t are folded into the adaptive scale below. NAMO uses one scalar
+ * alpha_t; NAMO-D uses column norms and a clamped right-diagonal D_t. The
+ * adaptive scale also multiplies decoupled weight decay, as in the paper's
+ * GPT-2 experiments. Ported verbatim from exp-namo @ e40b8c0: the gate now
+ * comes from the shared step_shape hook and `(h,bid)` replaces `sig`. */
+void namo_rows(const optcfg *o, float *w, float *m, const float *g,
+    float *vs, float *vc, size_t set, size_t rows, size_t cols, float scale,
+    float lr, float wd, bool diag, const opt_hooks *h, unsigned bid)
+{
+	(void)bid; /* no risk bank on the NAMO path */
+	float x[NS_MAXEL], a[NS_MAXEL], b[NS_MAXEL], y[NS_MAXEL];
+	float mn[NS_MAXDIM], gn[NS_MAXDIM], d[NS_MAXDIM];
+	const bool tr = rows > cols;
+	const size_t mr = tr ? cols : rows, mc = tr ? rows : cols;
+	if (rows * cols > NS_MAXEL || mr == 0 || mc == 0 ||
+	    cols > NS_MAXDIM || rows > NS_MAXDIM)
+		return;
+	const bool arow = diag && o->drow; /* ablation: scale rows, not columns */
+	const size_t nd = arow ? rows : cols;
+	const bool gated = h && h->shape.begin && h->shape.gate;
+	const float mu1 = o->mom, mu2 = o->nb2;
+	float mm = 0.0f, gg = 0.0f;
+	for (size_t j = 0; j < nd; j++)
+		mn[j] = gn[j] = 0.0f;
+	for (size_t i = 0; i < rows * cols; i++) {
+		float gi = g[i] * scale;
+		m[i] = mu1 * m[i] + gi;
+		mm += m[i] * m[i];
+		gg += gi * gi;
+		size_t jd = arow ? i / cols : i % cols;
+		mn[jd] += m[i] * m[i];
+		gn[jd] += gi * gi;
+		float u = o->nesterov ? mu1 * m[i] + gi : m[i];
+		size_t at = tr ? (i % cols) * mc + i / cols : i;
+		x[at] = u;
+	}
+	vs[set] = mu2 * vs[set] + (1.0f - mu2) * gg;
+	/* mscale * ||m|| / (sqrt(v) + eps) == ||Mhat|| / (sqrt(vhat)+eps_t) */
+	const float mscale = (1.0f - mu1) / (1.0f - o->n1t) *
+	    fsqrt(1.0f - o->n2t);
+	float alpha = mscale * fsqrt(mm) / (fsqrt(vs[set]) + o->eps);
+	if (diag) {
+		float dbar = 0.0f;
+		for (size_t j = 0; j < nd; j++) {
+			size_t vi = set * P1_HMAX + j;
+			vc[vi] = mu2 * vc[vi] + (1.0f - mu2) * gn[j];
+			d[j] = mscale * fsqrt(mn[j]) /
+			    (fsqrt(vc[vi]) + o->eps);
+			dbar += d[j];
+		}
+		dbar /= (float)nd;
+		if (o->nclamp > 0.0f) {
+			const float lo = o->nclamp * dbar, hi = dbar / o->nclamp;
+			for (size_t j = 0; j < nd; j++)
+				d[j] = d[j] < lo ? lo : d[j] > hi ? hi : d[j];
+		}
+	}
+	/* Shared Newton-Schulz (fit_opt.h): same direction as muon_rows. */
+	float ss = 0.0f;
+	for (size_t i = 0; i < mr * mc; i++)
+		ss += x[i] * x[i];
+	float norm = fsqrt(ss);
+	if (!(norm > 1e-12f))
+		return;
+	for (size_t i = 0; i < mr * mc; i++)
+		x[i] *= 1.0f / norm;
+	ns_ortho(x, a, b, y, mr, mc, o->ns_steps);
+	if (gated)
+		h->shape.begin(h->shape.ctx, g, rows * cols, scale);
+	const float step = lr * o->nscale;
+	for (size_t i = 0; i < rows * cols; i++) {
+		size_t at = tr ? (i % cols) * mc + i / cols : i;
+		float upd = x[at] + wd * w[i];
+		if (gated)
+			upd *= h->shape.gate(h->shape.ctx, i, g[i] * scale);
+		w[i] -= step * (diag ? d[arow ? i / cols : i % cols] : alpha) *
+		    upd;
+	}
 }

@@ -11,9 +11,6 @@
 #include <string.h>
 #include <time.h>
 
-#if defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>
-#endif
 
 #include "fit_internal.h"
 #include "fit_opt.h"
@@ -24,6 +21,171 @@
 #include "taw_internal.h"
 
 /* fsqrt and the Newton-Schulz polynomial live in fit_opt.h (one copy). */
+
+/* ---- weight averaging (encoder-only fitting experiment) --------------------
+ * Averaging happens after the optimizer's per-set update and before the
+ * existing quantize/serialize path; format and decoder are untouched.
+ * A/B: TAW_FIT_AVG={off,swa,ema9,ema99,ema999,late,...}; the compile-time
+ * default is OFF, so no override is byte-for-byte upstream. "late" (EMA
+ * 0.999 for >= 6 epochs) is explicit opt-in only.
+ *
+ * This feature uses the shared optimizer ABI: pre_step initialises the
+ * averaging state at un-tie, post_set folds in each touched set, finalize
+ * writes the averaged weights back. No EMA/SWA state is threaded through
+ * tnet_init/tnet_train signatures. */
+enum { TAW_AVG_OFF = 0, TAW_AVG_SWA = 1, TAW_AVG_EMA9 = 2,
+	TAW_AVG_EMA99 = 3, TAW_AVG_SWA_ALL = 4, TAW_AVG_EMA95 = 5,
+	TAW_AVG_EMA999 = 6, TAW_AVG_LATE = 7 };
+#ifndef TAW_FIT_AVG_DEFAULT
+#define TAW_FIT_AVG_DEFAULT TAW_AVG_OFF
+#endif
+
+static int parse_avg_mode(const char *s)
+{
+	if (!s || !*s)
+		return TAW_FIT_AVG_DEFAULT;
+	if (!strcmp(s, "0") || !strcmp(s, "off"))
+		return TAW_AVG_OFF;
+	if (!strcmp(s, "1") || !strcmp(s, "swa"))
+		return TAW_AVG_SWA;
+	if (!strcmp(s, "2") || !strcmp(s, "ema9") || !strcmp(s, "ema09"))
+		return TAW_AVG_EMA9;
+	if (!strcmp(s, "3") || !strcmp(s, "ema99"))
+		return TAW_AVG_EMA99;
+	if (!strcmp(s, "4") || !strcmp(s, "swa_all"))
+		return TAW_AVG_SWA_ALL;
+	if (!strcmp(s, "5") || !strcmp(s, "ema95"))
+		return TAW_AVG_EMA95;
+	if (!strcmp(s, "6") || !strcmp(s, "ema999"))
+		return TAW_AVG_EMA999;
+	if (!strcmp(s, "7") || !strcmp(s, "late"))
+		return TAW_AVG_LATE;
+	return TAW_FIT_AVG_DEFAULT;
+}
+
+/* Averaging needs a long enough run: levels 1-2 (3-4 epochs) are slightly
+ * hurt by EMA, levels 3+ (6-12 epochs) benefit. */
+static int resolve_avg_mode(int mode, int epochs)
+{
+	if (mode == TAW_AVG_LATE)
+		return epochs >= 6 ? TAW_AVG_EMA999 : TAW_AVG_OFF;
+	return mode;
+}
+
+static bool mode_is_ema(int m)
+{
+	return m == TAW_AVG_EMA9 || m == TAW_AVG_EMA95 || m == TAW_AVG_EMA99 ||
+	       m == TAW_AVG_EMA999;
+}
+
+static float mode_ema_decay(int m)
+{
+	switch (m) {
+	case TAW_AVG_EMA9:  return 0.9f;
+	case TAW_AVG_EMA95: return 0.95f;
+	case TAW_AVG_EMA99: return 0.99f;
+	default:            return 0.999f;
+	}
+}
+
+/* d2[k] = decay^(2^k): binary exponentiation of the number of steps since a
+ * set joined the EMA. No libm, no fast-math, no SIMD divergence. */
+static inline float ema_pow(const float d2[64], uint64_t gap)
+{
+	float f = 1.0f;
+	int k = 0;
+	while (gap) {
+		if (gap & 1u)
+			f *= d2[k];
+		gap >>= 1;
+		k++;
+	}
+	return f;
+}
+
+/* Hook context: stack-local in fit_one, reached through opt_hooks.ctx. */
+typedef struct {
+	int mode;
+	float d2[64];
+	bool live;
+	uint64_t nswa;
+} avg_ctx;
+
+/* Called at training start and again at un-tie. The tied flag is false when
+ * averaging state must (re)initialise: untouched sets hold stale weights
+ * before un-tie, and the EMA gaps must start from the un-tie step. */
+static void avg_pre_step(void *v, struct tnet *t, optcfg *o, uint64_t step,
+    bool tied)
+{
+	avg_ctx *a = v;
+	(void)o;
+	if (!a || a->mode == TAW_AVG_OFF || tied)
+		return;
+	size_t np = t->n1 + t->n2;
+	if (mode_is_ema(a->mode)) {
+		memcpy(t->wa, t->w, np * sizeof(float));
+		for (size_t k = 0; k < t->s1 + 1; k++)
+			t->last1[k] = step;
+		for (size_t k = 0; k < t->s2; k++)
+			t->last2[k] = step;
+		a->live = true;
+	} else {
+		/* SWA: discard anything accumulated before un-tie. */
+		memset(t->wa, 0, np * sizeof(float));
+		a->nswa = 0;
+	}
+}
+
+/* One touched set's post-update fold-in. layer is 1 (W1) or 2 (W2); off/len
+ * are the row's slice in t->w. Untouched weights are constant over the gap,
+ * so decaying toward the current w is the time-weighted EMA. */
+static void avg_post_set(void *v, struct tnet *t, unsigned layer, unsigned set,
+    size_t off, size_t len, uint64_t step)
+{
+	avg_ctx *a = v;
+	if (!a || !a->live || !mode_is_ema(a->mode))
+		return;
+	uint64_t *last = layer == 1 ? &t->last1[set] : &t->last2[set];
+	float d = ema_pow(a->d2, step - *last);
+	float *av = t->wa + off, *w = t->w + off;
+	for (size_t i = 0; i < len; i++)
+		av[i] = d * av[i] + (1.0f - d) * w[i];
+	*last = step;
+}
+
+/* Final write-back: the quantizer sees the averaged weights. */
+static void avg_finalize(void *v, struct tnet *t)
+{
+	avg_ctx *a = v;
+	if (!a || a->mode == TAW_AVG_OFF)
+		return;
+	size_t np = t->n1 + t->n2;
+	if (mode_is_ema(a->mode)) {
+		if (a->live)
+			memcpy(t->w, t->wa, np * sizeof(float));
+	} else if (a->nswa) {
+		float inv = 1.0f / (float)a->nswa;
+		for (size_t i = 0; i < np; i++)
+			t->w[i] = t->wa[i] * inv;
+	}
+}
+
+static void avg_hooks_init(opt_hooks *h, avg_ctx *a, int mode)
+{
+	memset(a, 0, sizeof *a);
+	a->mode = mode;
+	if (mode_is_ema(mode)) {
+		const float decay = mode_ema_decay(mode);
+		a->d2[0] = decay;
+		for (int k = 1; k < 64; k++)
+			a->d2[k] = a->d2[k - 1] * a->d2[k - 1];
+	}
+	memset(h, 0, sizeof *h);
+	h->ctx = a;
+	h->pre_step = avg_pre_step;
+	h->post_set = avg_post_set;
+	h->finalize = avg_finalize;
+}
 
 /* log2(x) for x > 0, good to ~1e-9; used only for size estimates. */
 static double dlog2(double x)
@@ -258,12 +420,18 @@ static void tnet_free(tnet *t)
 	free(t->malt_l);
 	free(t->malt_r);
 	free(t->malt_nu);
+	free(t->v2s);
+	free(t->v2c);
+	free(t->sig);
 	free(t->touched1);
 	free(t->touched2);
 	free(t->list1);
 	free(t->list2);
 	free(t->cnt1);
 	free(t->route1);
+	free(t->wa);
+	free(t->last1);
+	free(t->last2);
 	memset(t, 0, sizeof *t);
 }
 
@@ -288,16 +456,26 @@ static taw_status tnet_init(tnet *t, const p1_shape *s, uint64_t seed)
 	t->malt_l = calloc(t->s1 * H + 1, sizeof(float));
 	t->malt_r = calloc(t->s1 * P1_F + 1, sizeof(float));
 	t->malt_nu = calloc(t->s1 + 1, sizeof(float));
+	t->v2s = calloc(t->s1 ? t->s1 : 1, sizeof(float));
+	t->v2c = calloc(t->n1 ? t->s1 * P1_HMAX : 1, sizeof(float));
+	t->sig = calloc(t->n1 ? t->n1 : 1, sizeof(float));
 	t->touched1 = calloc(t->s1 + 1, 1);
 	t->touched2 = calloc(t->s2, 1);
 	t->list1 = malloc((t->s1 + 1) * sizeof(uint32_t));
 	t->list2 = malloc(t->s2 * sizeof(uint32_t));
 	t->cnt1 = calloc(t->s1 ? t->s1 : 1, sizeof(uint32_t));
 	t->route1 = calloc(t->s1 ? t->s1 : 1, 1);
+	/* Averaging scratch: allocated unconditionally (like upstream's MALT
+	 * state) so tnet_init keeps its shipped signature. It stays untouched
+	 * unless the hooks are enabled. */
+	t->wa = calloc(np, sizeof(float));
+	t->last1 = calloc(t->s1 + 1, sizeof(uint64_t));
+	t->last2 = calloc(t->s2, sizeof(uint64_t));
 	if (!t->w || !t->m || !t->v || !t->g || !t->m1 || !t->v1 ||
 	    !t->malt_l || !t->malt_r || !t->malt_nu ||
+	    !t->v2s || !t->v2c || !t->sig ||
 	    !t->touched1 || !t->touched2 || !t->list1 || !t->list2 ||
-	    !t->cnt1 || !t->route1) {
+	    !t->cnt1 || !t->route1 || !t->wa || !t->last1 || !t->last2) {
 		tnet_free(t);
 		return TAW_E_NOMEM;
 	}
@@ -406,6 +584,13 @@ static void tnet_untie(tnet *t)
 		    P1_F * sizeof(float));
 		t->malt_nu[set] = t->malt_nu[0];
 	}
+	/* NAMO / NAMO-D second moments and the shared sign EMA are W1-only state. */
+	for (size_t set = 1; set < t->s1; set++) {
+		t->v2s[set] = t->v2s[0];
+		memcpy(t->v2c + set * P1_HMAX, t->v2c, P1_HMAX * sizeof(float));
+		memcpy(t->sig + set * t->row1, t->sig,
+		    t->row1 * sizeof(float));
+	}
 	t->tied = false;
 }
 
@@ -423,7 +608,6 @@ static void tnet_untie(tnet *t)
  * opt_hooks) and the thin wrappers all live in fit_opt.h / fit_opt.c. This
  * file keeps only env parsing, the LR schedule and the per-set dispatch.
  */
-
 /* Tuning hooks (encoder-only; unset = shipped behaviour). */
 static float fit_env_float(const char *name, float def)
 {
@@ -825,16 +1009,228 @@ static void faro_report(const faro_ctx *f)
 	fprintf(stderr, "\n");
 }
 
+/* One shared step_shape adapter for NAMO's optional shrink gate. The gate
+ * arithmetic is fit_gate_step() in fit_opt.c; there is no second owner. */
+typedef struct {
+	float *sig;  /* shared sign EMA (t->sig) */
+	float *mul;  /* per-coordinate bank filled by begin(), read by gate() */
+	float beta, p;
+} namo_gate;
+
+static void namo_gate_begin(void *v, const float *g, size_t len, float scale)
+{
+	namo_gate *c = v;
+	for (size_t k = 0; k < len; k++)
+		c->mul[k] = fit_gate_step(&c->sig[k], g[k] * scale,
+		    c->beta, c->p);
+}
+
+static float namo_gate_at(void *v, size_t k, float gk)
+{
+	namo_gate *c = v;
+	(void)gk; /* the multiplier bank was filled by begin() */
+	return c->mul[k];
+}
+
+/* ---- C3 sign-consistency gate (PR #8, opt-in, CPU only) ------------------------
+ * The gate arithmetic itself belongs to the foundation: fit_gate_step() in
+ * fit_opt.c is the single implementation. Here we only parse knobs and wire
+ * the foundation's step_shape slot into the AdamW vector updates. Muon/MALT/
+ * MALTER W1 paths are never shaped. Default TAW_EPS_MODE=none is bit-exact
+ * upstream behaviour. */
+
+enum { SCOPE_ALL = 0, SCOPE_COLD, SCOPE_WARM };
+
+typedef struct {
+	bool enabled;
+	float beta, p;
+	bool mean_pres;  /* mean-preserving vs shrink-only */
+	int layers;      /* bit 0: layer 1 (AdamW path), bit 1: layer 2 */
+	int scope;       /* SCOPE_* (touch-count stratification) */
+	bool debug;
+} eps_cfg;
+
+static bool eps_mode_off(const char *m)
+{
+	return !m || !*m || !strcmp(m, "none") || !strcmp(m, "off") ||
+	    !strcmp(m, "0");
+}
+
+/* Only the literal "c3" enables the gate; c2/nc9/junk are errors, never an
+ * implicit enable (I5). */
+static bool eps_mode_enabled(void)
+{
+	const char *m = getenv("TAW_EPS_MODE");
+	return m && !strcmp(m, "c3");
+}
+
+/* Coalescing arbitration: #6 requires every TAW_NAMO_* knob (including the
+ * shared TAW_EPS_MODE gate) to be inert off-NAMO, while #8 deliberately
+ * enables the gate on plain AdamW. Both published CRC sets are preserved by
+ * giving the NAMO leak guard precedence whenever NAMO-only knobs are set and
+ * the NAMO geometry is not selected. Pure #8 configurations have no NAMO
+ * knobs and keep the gate. */
+static bool namo_knobs_present(void)
+{
+	static const char *const names[] = {"TAW_NAMO_BETA", "TAW_NAMO_SCALE",
+		"TAW_NAMO_CLAMP", "TAW_NAMO_WD", "TAW_NAMO_D_AXIS",
+		"TAW_NAMO_NEST"};
+	for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+		const char *v = getenv(names[i]);
+		if (v && *v)
+			return true;
+	}
+	return false;
+}
+
+static taw_status eps_mode_validate(void)
+{
+	const char *m = getenv("TAW_EPS_MODE");
+	if (eps_mode_off(m) || eps_mode_enabled())
+		return TAW_OK;
+	fprintf(stderr, "taw fit: TAW_EPS_MODE=%s is invalid (use none|c3)\n",
+	    m ? m : "");
+	return TAW_E_ARG;
+}
+
+static eps_cfg eps_config(void)
+{
+	eps_cfg c = {.enabled = eps_mode_enabled(), .beta = 0.9f, .p = 1.0f,
+		.mean_pres = true, .layers = 2, .scope = SCOPE_ALL};
+	c.beta = fit_env_float("TAW_EPS_SIGN_BETA", c.beta);
+	c.p = fit_env_float("TAW_EPS_GATE_P", c.p);
+	const char *gm = getenv("TAW_EPS_GATE_MODE");
+	if (gm && !strcmp(gm, "shrink")) c.mean_pres = false;
+	const char *l = getenv("TAW_EPS_LAYERS");
+	if (l) {
+		c.layers = 0;
+		if (strchr(l, '1')) c.layers |= 1;
+		if (strchr(l, '2')) c.layers |= 2;
+	}
+	const char *sc = getenv("TAW_EPS_SCOPE");
+	if (sc) {
+		if (!strcmp(sc, "cold")) c.scope = SCOPE_COLD;
+		else if (!strcmp(sc, "warm")) c.scope = SCOPE_WARM;
+	}
+	c.debug = getenv("TAW_EPS_DEBUG") != nullptr;
+	return c;
+}
+
+/* Scratch bank covers any mixer width (P1_XPAD >= P1_F); out-of-range rows
+ * simply bypass the gate instead of reading out of bounds. */
+enum { EPS_GATE_CAP = P1_HMAX * P1_XPAD + 1 };
+
+typedef struct {
+	float *sig;      /* sign EMA, one float per weight */
+	size_t off;      /* current weight-row offset into sig */
+	float beta, p;
+	bool mean_pres;
+	float bank[EPS_GATE_CAP];
+	float gmean;
+	bool over;
+	float acc;       /* debug: accumulated row-mean gate */
+} c3_ctx;
+
+static void c3_begin(void *vctx, const float *g, size_t len, float scale)
+{
+	c3_ctx *c = vctx;
+	c->over = len > EPS_GATE_CAP;
+	if (c->over) {
+		c->gmean = 1.0f;
+		return;
+	}
+	float sum = 0.0f;
+	float *sig = c->sig + c->off;
+	for (size_t k = 0; k < len; k++) {
+		c->bank[k] = fit_gate_step(sig + k, g[k] * scale, c->beta, c->p);
+		sum += c->bank[k];
+	}
+	c->gmean = c->mean_pres ? sum / (float)len : 1.0f;
+	if (c->gmean < 1e-12f) /* sign EMA not established yet: no gating */
+		c->gmean = 1.0f;
+}
+
+static float c3_gate(void *vctx, size_t k, float gk)
+{
+	c3_ctx *c = vctx;
+	(void)gk;
+	if (c->over)
+		return 1.0f;
+	float fac = c->mean_pres ? c->bank[k] / c->gmean : c->bank[k];
+	c->acc += fac;
+	return fac;
+}
+
+/* Per-set diagnostics for the touch-count stratification. */
+typedef struct {
+	double touches, sum_gate;
+} eps_stats;
+
+/* Median of the positive entries of a[] (0 if none), for the cold/warm split.
+ * Frequencies come from the sample selector values, not the training order. */
+static size_t positive_median(const size_t *a, size_t n)
+{
+	size_t *v = malloc((n ? n : 1) * sizeof *v);
+	if (!v)
+		return 0;
+	size_t m = 0;
+	for (size_t i = 0; i < n; i++)
+		if (a[i])
+			v[m++] = a[i];
+	if (!m) {
+		free(v);
+		return 0;
+	}
+	for (size_t i = 1; i < m; i++) { /* insertion sort; n <= 4096 */
+		size_t x = v[i], j = i;
+		while (j && v[j - 1] > x) {
+			v[j] = v[j - 1];
+			j--;
+		}
+		v[j] = x;
+	}
+	size_t med = v[m / 2];
+	free(v);
+	return med;
+}
+
+static inline bool in_scope(int scope, size_t freq, size_t med)
+{
+	if (scope == SCOPE_ALL || !freq)
+		return scope == SCOPE_ALL;
+	return scope == SCOPE_COLD ? freq < med : freq >= med;
+}
+
 /* Train on samples for the given epochs. Batches touch few weight sets, so
  * only those rows are updated ("lazy" optimizer state). With no environment
  * overrides this is the shipped AdamW fitter, bit for bit. */
 static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
-    uint64_t seed)
+    uint64_t seed, const opt_hooks *hooks_in)
 {
 	enum { BATCH = FIT_BATCH };
 	/* One hook ABI. FARO publishes its per-block risk bank through hooks.risk;
 	 * with TAW_FARO off the bank stays NULL and every shipped path is bit-exact. */
-	opt_hooks hooks = {0};
+	opt_hooks hooks = hooks_in ? *hooks_in : (opt_hooks){0};
+	opt_hooks *h = &hooks; /* EMA hooks copied in; C3 fills shape */
+	const size_t np = t->n1 + t->n2;
+	/* One hook ABI: C3 fills shape, EMA fills the pre/post hooks in fit_one,
+	 * NAMO uses its own W1-only copy, and the base FARO owns risk/nb. */
+	opt_hooks namo_hooks = {0};
+	namo_gate ng = {0};
+	float nmul[NS_MAXEL]; /* shrink bank, reused for each W1 set */
+	const eps_cfg ecfg = eps_config();
+	c3_ctx c3 = {0};
+	const char *early_hs = fit_env_str("TAW_HYBRID", "adam");
+	const bool early_namo = !strcmp(early_hs, "namo") ||
+	    !strcmp(early_hs, "namod") || !strcmp(early_hs, "namo-d");
+	/* NAMO owns its own gate through namo_hooks; never also gate W2 here. */
+	if (ecfg.enabled && !early_namo && !namo_knobs_present()) {
+		c3.beta = ecfg.beta;
+		c3.p = ecfg.p;
+		c3.mean_pres = ecfg.mean_pres;
+		/* shape has its own ctx; hooks.ctx stays owned by EMA. */
+		hooks.shape = (step_shape){&c3, c3_begin, c3_gate, nullptr};
+	}
 	const char *hs = fit_env_str("TAW_HYBRID", "adam");
 	hyb_mode mode = HYB_ADAM;
 	if (!strcmp(hs, "muon"))
@@ -845,6 +1241,10 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 		mode = HYB_ALT;
 	else if (!strcmp(hs, "route"))
 		mode = HYB_ROUTE;
+	else if (!strcmp(hs, "namo"))
+		mode = HYB_NAMO;
+	else if (!strcmp(hs, "namod") || !strcmp(hs, "namo-d"))
+		mode = HYB_NAMOD;
 	/* MALT is a separate opt-in: unset (or "off"/"0") keeps every shipped
 	 * path bit-identical. "1"/"on"/"malt" = MALT, "malter" = adaptive. */
 	const char *ms = fit_env_str("TAW_MALT", "off");
@@ -858,7 +1258,11 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 	/* LR endpoints. Plain AdamW defaults to the shipped schedule; each
 	 * other component has its own knob so the two LRs can be tuned apart. */
 	const float lr0 = fit_env_float("TAW_LR0", 0.02f);
-	const float lr1 = fit_env_float("TAW_LR1", lr0 / 20.0f);
+	/* PR #7 convenience: TAW_LR1=flat keeps LR constant at TAW_LR0. */
+	const char *lr1s = getenv("TAW_LR1");
+	float lr1 = fit_env_float("TAW_LR1", lr0 / 20.0f);
+	if (lr1s && strcmp(lr1s, "flat") == 0)
+		lr1 = lr0;
 	const float vec_lr0 = fit_env_float("TAW_VEC_LR0", lr0);
 	const float vec_lr1 = fit_env_float("TAW_VEC_LR1", lr1);
 	const float m_lr0 = fit_env_float("TAW_MUON_LR0", 0.01f);
@@ -868,14 +1272,34 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 	/* MALT/MALTER W1 LR endpoints default to the tuned Muon schedule. */
 	const float malt_lr0 = fit_env_float("TAW_MALT_LR0", 0.055f);
 	const float malt_lr1 = fit_env_float("TAW_MALT_LR1", 0.0011f);
+	const bool is_namo = mode == HYB_NAMO || mode == HYB_NAMOD;
 	optcfg o = {.b1 = fit_env_float("TAW_B1", 0.9f),
 		.b2 = fit_env_float("TAW_B2", 0.999f),
 		.eps = 1e-6f,
 		.mom = fit_env_float("TAW_MUON_MOM", 0.95f),
 		.gain = fit_env_float("TAW_MUON_GAIN", 0.2f),
 		.b1t = 1.0f, .b2t = 1.0f,
+		.n1t = 1.0f, .n2t = 1.0f,
+		.nb2 = fit_env_float("TAW_NAMO_BETA", 0.99f),
+		.nscale = fit_env_float("TAW_NAMO_SCALE", 1.0f),
+		.nclamp = fit_env_float("TAW_NAMO_CLAMP", 0.1f),
 		.ns_steps = fit_env_uint("TAW_MUON_NS", 5),
-		.nesterov = fit_env_uint("TAW_MUON_NEST", 1) != 0};
+		.nesterov = fit_env_uint("TAW_MUON_NEST", 1) != 0,
+		.drow = !strcmp(fit_env_str("TAW_NAMO_D_AXIS", "col"), "row")};
+	/* NAMO has its own NEST switch (default 0: the paper's M_t direction). */
+	if (is_namo)
+		o.nesterov = fit_env_uint("TAW_NAMO_NEST", 0) != 0;
+	/* Shared gate (I4): TAW_EPS_MODE=c3, with the #8 beta/p knobs. It is
+	 * wired only into the NAMO hook, never into AdamW/Muon/MALTER. */
+	if (is_namo && !strcmp(fit_env_str("TAW_EPS_MODE", "none"), "c3")) {
+		ng.sig = t->sig;
+		ng.mul = nmul;
+		ng.beta = fit_env_float("TAW_EPS_SIGN_BETA", 0.9f);
+		ng.p = fit_env_float("TAW_EPS_GATE_P", 1.0f);
+		namo_hooks.shape.ctx = &ng;
+		namo_hooks.shape.begin = namo_gate_begin;
+		namo_hooks.shape.gate = namo_gate_at;
+	}
 	/* Diagonal preconditioner: l/r EMA decay and damping (paper eps). */
 	o.malt_b2 = fit_env_float("TAW_MALT_B2", 0.999f);
 	o.malt_eps = fit_env_float("TAW_MALT_EPS", 1e-8f);
@@ -886,6 +1310,8 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 		: !strcmp(gs, "m") ? GRAFT_M : GRAFT_O;
 	o.vecwd = fit_env_float("TAW_WD", 1e-5f);
 	o.wd = fit_env_float("TAW_MUON_WD", mode == HYB_ADAM ? o.vecwd : 1e-3f);
+	if (is_namo)
+		o.wd = fit_env_float("TAW_NAMO_WD", o.wd);
 	o.wd1 = fit_env_float("TAW_ADAM1_WD", o.vecwd);
 	const float alpha = fit_env_float("TAW_ALPHA", 0.5f);
 	const bool warm_adam = !strcmp(fit_env_str("TAW_WARM", "muon"), "adam");
@@ -942,9 +1368,45 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 	const unsigned H = t->s.hidden;
 	const int warm = fit_warm_epochs(epochs);
 	t->tied = t->s1 > 1 || t->s2 > 1;
+
+	/* C3 sign-EMA state and touch-count strata. */
+	c3.sig = ecfg.enabled ? calloc(np, sizeof *c3.sig) : nullptr;
+	eps_stats *st1 = ecfg.debug && H ? calloc(t->s1 + 1, sizeof *st1) : nullptr;
+	eps_stats *st2 = ecfg.debug ? calloc(t->s2 ? t->s2 : 1, sizeof *st2) : nullptr;
+	size_t *f1 = (H && ecfg.scope != SCOPE_ALL)
+	    ? calloc(t->s1 + 1, sizeof *f1) : nullptr;
+	size_t *f2 = ecfg.scope != SCOPE_ALL ? calloc(t->s2 ? t->s2 : 1,
+	    sizeof *f2) : nullptr;
+	size_t med1 = 0, med2 = 0;
+	if (f1 || f2) {
+		for (size_t i = 0; i < ns; i++) {
+			const p1_sel_ctx sc = sample_sc(&sm[i]);
+			if (f2)
+				f2[p1_sel_value(t->s.sel2, &sc)]++;
+			if (f1)
+				f1[p1_sel_value(t->s.sel1, &sc)]++;
+		}
+		med1 = f1 ? positive_median(f1, t->s1 + 1) : 0;
+		med2 = f2 ? positive_median(f2, t->s2) : 0;
+	}
+	/* EMA/SWA: initialise averaging state before the first epoch. */
+	if (h->pre_step)
+		h->pre_step(h->ctx, t, &o, step, t->tied);
 	for (int ep = 0; ep < epochs; ep++) {
-		if (t->tied && ep >= warm)
+		if (t->tied && ep >= warm) {
 			tnet_untie(t);
+			if (c3.sig) { /* mirror the seed set's sign state like m/v */
+				for (size_t set = 1; set < t->s1; set++)
+					memcpy(c3.sig + set * t->row1, c3.sig,
+					    t->row1 * sizeof *c3.sig);
+				for (size_t set = 1; set < t->s2; set++)
+					memcpy(c3.sig + t->n1 + set * t->row2,
+					    c3.sig + t->n1,
+					    t->row2 * sizeof *c3.sig);
+			}
+			if (h->pre_step)
+				h->pre_step(h->ctx, t, &o, step, t->tied);
+		}
 		const uint64_t stride = fit_stride(ns);
 		uint64_t pos = rng_next(&rs) % (ns ? ns : 1);
 		for (size_t done = 0; done < ns;) {
@@ -989,6 +1451,8 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 			o.b2t *= o.b2;
 			o.malt_b1t *= o.mom;
 			o.malt_b2t *= o.malt_b2;
+			o.n1t *= o.mom;
+			o.n2t *= o.nb2;
 			bool alt_muon = alt_step ? (step & 1) == 1
 						 : (frac < 0.5f);
 			if (!alt_first_muon)
@@ -1003,8 +1467,16 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 			fr.risk = fr.on && fr.frozen && fr.alloc ? fr.usum : nullptr;
 			hooks.risk = fr.risk;
 			hooks.nb = fr.on ? (unsigned)fr.nb : 0u;
+			/* Mask C3's shape for sets outside its scope while leaving every
+			 * other hook slot (notably FARO's risk bank) untouched. */
+			opt_hooks nogate = hooks;
+			nogate.shape = (step_shape){0};
 			for (size_t k = 0; k < n1; k++) {
 				size_t set = t->list1[k], off = set * t->row1;
+				const bool g1 = ecfg.enabled && (ecfg.layers & 1) &&
+				    in_scope(ecfg.scope, f1 ? f1[set] : 1, med1);
+				if (g1)
+					c3.off = off;
 				bool muon = mode == HYB_MUON ||
 				    (mode == HYB_ALT && alt_muon) ||
 				    (mode == HYB_ROUTE && t->route1[set]);
@@ -1041,7 +1513,7 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 					adam_rows(&o, t->w + off, t->m + off,
 					    t->v + off, t->g + off, t->row1,
 					    scale, lrvec_w1, o.vecwd, 1.0f,
-					    &hooks, bid);
+					    g1 ? &hooks : &nogate, bid);
 				} else if (malty && !(t->tied && warm_adam)) {
 					malt_rows(&o, t->w + off, t->m + off,
 					    t->malt_l + set * H,
@@ -1049,11 +1521,17 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 					    t->malt_nu + set, t->g + off,
 					    H, P1_F, scale, lr_w1, o.wd, 1.0f,
 					    mode == HYB_MALTER, &hooks, bid);
+				} else if (is_namo && !(t->tied && warm_adam)) {
+					/* P6-3: match MALT's tied AdamW warm-up guard. */
+					namo_rows(&o, t->w + off, t->m + off,
+					    t->g + off, t->v2s, t->v2c, set,
+					    H, P1_F, scale, o.lr, o.wd,
+					    mode == HYB_NAMOD, &namo_hooks, 0);
 				} else if (mode == HYB_BLEND) {
 					adam_rows(&o, t->w + off, t->m1 + off,
 					    t->v1 + off, t->g + off, t->row1,
 					    scale, lr_a1, o.wd1, 1.0f - alpha,
-					    &hooks, bid);
+					    g1 ? &hooks : &nogate, bid);
 					muon_rows(&o, t->w + off, t->m + off,
 					    t->g + off, H, P1_F, scale, lr_w1,
 					    o.wd, alpha, &hooks, bid);
@@ -1065,28 +1543,59 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 					adam_rows(&o, t->w + off, t->m1 + off,
 					    t->v1 + off, t->g + off, t->row1,
 					    scale, lr_a1, o.wd1, 1.0f,
-					    &hooks, bid);
+					    g1 ? &hooks : &nogate, bid);
 				}
+				if (g1 && st1) {
+					st1[set].touches += 1.0;
+					st1[set].sum_gate += c3.acc / (float)t->row1;
+				}
+				c3.acc = 0.0f;
+				if (h->post_set)
+					h->post_set(h->ctx, t, 1, (unsigned)set, off,
+					    t->row1, step);
 				t->touched1[set] = 0;
 			}
 			for (size_t k = 0; k < n2; k++) {
-				size_t set = t->list2[k];
-				size_t off = t->n1 + set * t->row2;
-				int fb = fr.on ? faro_b2(&fr, (unsigned)set) : 0;
+				const size_t s2 = t->list2[k];
+				size_t off = t->n1 + s2 * t->row2;
+				int fb = fr.on ? faro_b2(&fr, (unsigned)s2) : 0;
 				float lrvec_b = o.lrvec;
 				if (fr.on)
 					lrvec_b *= fr.mu[fb];
+				const bool g2 = ecfg.enabled && (ecfg.layers & 2) &&
+				    in_scope(ecfg.scope, f2 ? f2[s2] : 1, med2);
+				if (g2)
+					c3.off = off;
 				adam_rows(&o, t->w + off, t->m + off, t->v + off,
 				    t->g + off, t->row2, scale, lrvec_b,
-				    o.vecwd, 1.0f, &hooks,
+				    o.vecwd, 1.0f, g2 ? &hooks : &nogate,
 				    fr.on ? (unsigned)fb : 0);
-				t->touched2[set] = 0;
+				if (g2 && st2) {
+					st2[s2].touches += 1.0;
+					st2[s2].sum_gate += c3.acc / (float)t->row2;
+				}
+				c3.acc = 0.0f;
+				if (h->post_set)
+					h->post_set(h->ctx, t, 2, (unsigned)s2, off,
+					    t->row2, step);
+				t->touched2[s2] = 0;
 			}
 			if (fr.on && fr.frozen && fr.alloc)
 				faro_measure(&fr, t);
 			memset(t->g, 0, (t->n1 + t->n2) * sizeof(float));
 		}
+		/* SWA is epoch-granular; use the hook's feature context for the
+		 * snapshot window instead of threading a mode parameter. */
+		avg_ctx *ac = h->ctx;
+		if (ac && ac->mode != TAW_AVG_OFF && !mode_is_ema(ac->mode) &&
+		    (ac->mode == TAW_AVG_SWA_ALL || ep >= epochs / 2)) {
+			for (size_t i = 0; i < np; i++)
+				t->wa[i] += t->w[i];
+			ac->nswa++;
+		}
 	}
+	if (h->finalize)
+		h->finalize(h->ctx, t);
 	if ((mode == HYB_MALT || mode == HYB_MALTER) && getenv("TAW_MALT_DEBUG")) {
 		float lmin = 1e30f, lmax = 0.0f, lsum = 0.0f;
 		float rmin = 1e30f, rmax = 0.0f, rsum = 0.0f;
@@ -1110,6 +1619,40 @@ static void tnet_train(tnet *t, const sample *sm, size_t ns, int epochs,
 	}
 	faro_report(&fr);
 	faro_free(&fr);
+	if (ecfg.debug) {
+		fprintf(stderr, "[eps] gate beta=%.3g p=%.3g mode=%s "
+			"layers=%d scope=%d\n", ecfg.beta, ecfg.p,
+			ecfg.mean_pres ? "mean" : "shrink", ecfg.layers,
+			ecfg.scope);
+		const char *ln[2] = {"layer1", "layer2"};
+		for (int L = 0; L < 2; L++) {
+			const eps_stats *s = L ? st2 : st1;
+			const size_t nset = L ? t->s2 : (H ? t->s1 : 0);
+			if (!s || !nset)
+				continue;
+			size_t nt = 0;
+			double tmin = 1e300, tmax = 0, tsum = 0, gsum = 0;
+			for (size_t i = 0; i < nset; i++) {
+				if (s[i].touches == 0.0)
+					continue;
+				nt++;
+				double tv = s[i].touches;
+				if (tv < tmin) tmin = tv;
+				if (tv > tmax) tmax = tv;
+				tsum += tv;
+				gsum += s[i].sum_gate / tv;
+			}
+			fprintf(stderr, "[eps] %s: touched=%zu min/med/max touches="
+				"%.0f/%.0f/%.0f mean_gate=%.4g\n",
+				ln[L], nt, tmin, nt ? tsum / (double)nt : 0.0, tmax,
+				nt ? gsum / (double)nt : 0.0);
+		}
+	}
+	free(c3.sig);
+	free(st1);
+	free(st2);
+	free(f1);
+	free(f2);
 }
 
 /* ---- quantization / serialization -------------------------------------------- */
@@ -1283,6 +1826,7 @@ typedef struct {
 	const sample *sm;
 	size_t ns;
 	int epochs;
+	int avg_mode; /* TAW_FIT_AVG, resolved once here per candidate */
 	uint64_t n;
 	taw_buf *model; /* [tries] */
 	double *est, *bpb;
@@ -1295,12 +1839,19 @@ static void fit_one(void *arg, size_t ci, unsigned w)
 	(void)w;
 	fit_job *F = arg;
 	tnet t;
+	/* EMA/SWA state lives in tnet; the behaviour is supplied by the shared
+	 * opt_hooks ABI. GPU-trained nets have no CPU trajectory: their hooks
+	 * stay NULL (fit_one never calls tnet_train for them). */
+	avg_ctx ac;
+	opt_hooks hooks;
+	avg_hooks_init(&hooks, &ac,
+	    resolve_avg_mode(F->avg_mode, F->epochs));
 	taw_status st = TAW_OK;
 	if (F->pre && F->pre[ci].w) {
 		t = F->pre[ci];
 		F->pre[ci] = (tnet){0};
 	} else if ((st = tnet_init(&t, &F->cs[ci].s, 0x7A57A11ull + ci)) == TAW_OK) {
-		tnet_train(&t, F->sm, F->ns, F->epochs, 0xC0FFEEull + ci);
+		tnet_train(&t, F->sm, F->ns, F->epochs, 0xC0FFEEull + ci, &hooks);
 	}
 	if (st == TAW_OK) {
 		st = serialize(&t, F->cs[ci].quant, &F->model[ci]);
@@ -1459,6 +2010,16 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 {
 	*out = (taw_model_choice){.profile = TAW_PROFILE_INT_ORDER0,
 		.quant = TAW_QUANT_NONE};
+	/* I5: c2/nc9/junk are errors, never an implicit gate enable. */
+	taw_status es = eps_mode_validate();
+	if (es != TAW_OK)
+		return es;
+	/* The sign gate is CPU-only. Reject instead of silently training GPU
+	 * candidates with plain AdamW. */
+	if (eps_mode_enabled() && p->gpu != TAW_GPU_OFF) {
+		fprintf(stderr, "taw fit: TAW_EPS_MODE=c3 is CPU-only; set -g off\n");
+		return TAW_E_ARG;
+	}
 	if (p->predictor == TAW_PREDICTOR_ORDER0)
 		return TAW_OK;
 	const uint64_t n = in->size;
@@ -1491,7 +2052,7 @@ taw_status taw_model_fit_source(const taw_source *in, uint64_t unit,
 		tries = ncand;
 
 	fit_job F = {.cs = cs, .sm = sm, .ns = ns, .epochs = effort[lv].epochs,
-		.n = n};
+		.avg_mode = parse_avg_mode(getenv("TAW_FIT_AVG")), .n = n};
 	F.model = calloc(tries, sizeof *F.model);
 	F.est = calloc(tries, sizeof *F.est);
 	F.bpb = calloc(tries, sizeof *F.bpb);

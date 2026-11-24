@@ -106,7 +106,9 @@ typedef enum {
 	HYB_ALT,      /* W1: alternate Muon / AdamW by step or by half */
 	HYB_ROUTE,    /* W1: Muon for hot sets, AdamW for cold sets */
 	HYB_MALT,     /* W1: MALT (two-sided diagonal preconditioned Muon) */
-	HYB_MALTER    /* W1: MALTER (MALT + adaptive step-size rescaling) */
+	HYB_MALTER,   /* W1: MALTER (MALT + adaptive step-size rescaling) */
+	HYB_NAMO,     /* W1: NAMO (scalar adaptive scale on Orth(M)) */
+	HYB_NAMOD     /* W1: NAMO-D (clamped diagonal right-multiplication) */
 } hyb_mode;
 
 /* Norm-grafting source for the MALT update magnitude. */
@@ -122,6 +124,9 @@ typedef struct {
 	float b1t, b2t;        /* b1^t, b2^t */
 	float malt_b2, malt_eps;   /* diagonal-preconditioner EMA / damping */
 	float malt_b1t, malt_b2t;  /* momentum^t, malt_b2^t (MALTER bias correction) */
+	float n1t, n2t;            /* mu1^t, mu2^t for NAMO / NAMO-D */
+	float nb2, nscale, nclamp; /* NAMO: mu2, step scale, NAMO-D clamp c */
+	bool drow;                 /* NAMO-D row-axis ablation */
 	unsigned ns_steps;
 	int graft;             /* MALT graft mode */
 	bool nesterov;
@@ -132,6 +137,7 @@ typedef struct {
  * leaves them NULL on shipped paths; optional fitting hooks are supplied by
  * encoder-side knobs instead of editing optimizer branches. tnet is opaque
  * here: its definition stays in fit_internal.h (shared with the GPU trainer).
+ * NAMO's gate is configured by the shared TAW_EPS_MODE knob, not a private one.
  */
 
 struct tnet;
@@ -200,5 +206,10 @@ void malt_rows(const optcfg *o, float *w, float *m, float *l, float *r,
 /* Linearized spectral return for FARO's TAW_FARO_STAT=lin lane: <g, NS(g)> /
  * ||NS(g)||_F. A thin caller of ns_ortho(), so the polynomial has one home. */
 float ns_score(const optcfg *o, const float *g, unsigned rows, unsigned cols);
+/* NAMO / NAMO-D (arXiv:2602.17080v2). vs/vc are per-set second moments,
+ * diag selects NAMO-D; the step shape hook supplies the optional shrink gate. */
+void namo_rows(const optcfg *o, float *w, float *m, const float *g,
+    float *vs, float *vc, size_t set, size_t rows, size_t cols, float scale,
+    float lr, float wd, bool diag, const opt_hooks *h, unsigned bid);
 
 #endif

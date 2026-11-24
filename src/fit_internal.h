@@ -17,7 +17,7 @@ typedef struct {
 } sample;
 
 /* The trainable network: layer-1 sets then output-layer sets, rows as the
- * model section stores them. */
+ * model section stores them. Named so fit_opt.h can take an opaque pointer. */
 typedef struct tnet {
 	p1_shape s;
 	size_t s1, s2, row1, row2; /* sets, params per set */
@@ -31,11 +31,18 @@ typedef struct tnet {
 	 * but allocated unconditionally so the shipped fitter is untouched. */
 	float *malt_l, *malt_r;    /* [s1*H], [s1*P1_F] */
 	float *malt_nu;            /* [s1] */
+	/* NAMO / NAMO-D W1 state: scalar second moment per set, column second
+	 * moments per set, plus the shared shrink-gate sign EMA per W1 weight. */
+	float *v2s, *v2c, *sig;    /* [s1], [s1*P1_HMAX], [n1] */
 	uint8_t *touched1, *touched2;
 	bool tied; /* warm-up: every sample uses set 0 */
 	uint32_t *list1, *list2;
 	uint32_t *cnt1;            /* [s1] samples per W1 set, for routing */
 	uint8_t *route1;           /* [s1] 1 = Muon, 0 = AdamW */
+	/* Averaging scratch (CPU fitter only): wa is the SWA sum or the live
+	 * EMA; last1/last2 record the global step each set joined the EMA. */
+	float *wa;
+	uint64_t *last1, *last2;
 } tnet;
 
 /* ---- deterministic PRNG ------------------------------------------------------ */

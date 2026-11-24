@@ -73,6 +73,25 @@ taw x archive.awseek /name out         # a named file
 taw i archive                          # header info and files
 ```
 
+### Encoder-only fitting knobs
+
+The fitted mixer (profile 1) accepts opt-in tuning knobs; unset means the
+shipped fitter, bit for bit.
+
+| variable | values (default) | effect |
+|---|---|---|
+| `TAW_EPS_MODE` | `none` (default), `c3` | enable the C3 sign gate on AdamW vector updates |
+| `TAW_EPS_SIGN_BETA` | `0.9` (default), `0.95` | sign-EMA decay |
+| `TAW_EPS_GATE_P` | `1` (default), `2` | gate exponent `\|sign EMA\|^p` |
+| `TAW_EPS_GATE_MODE` | `mean` (default), `shrink` | normalize by the row mean, or shrink directly |
+| `TAW_EPS_LAYERS` | `2` (default), `1`, `12` | which layer(s) to gate (1 = hidden, 2 = output) |
+| `TAW_EPS_SCOPE` | `all` (default), `cold`, `warm` | apply only to the lower/upper half by touch count |
+| `TAW_EPS_DEBUG` | any value | print per-set touch counts and mean gate to stderr |
+
+`c2`/`nc9` and any other `TAW_EPS_MODE` value are errors (use `none|c3`).
+The gate is CPU-only: with `TAW_EPS_MODE=c3` and `-g on` or `-g auto`,
+fitting fails with `invalid argument`.
+
 ## taw-nx: Switch dumps
 
 `tools/taw-nx` turns XCI/NSP dumps into `.awseek` archives (the dump plus a
