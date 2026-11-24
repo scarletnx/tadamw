@@ -960,7 +960,7 @@ static void predictor_slots(void)
 		taw_params p = {.predictor = (taw_predictor)bad[i]}, r;
 		CHECK(taw_params_resolve(&p, &r) == TAW_E_ARG);
 	}
-	/* In the coalesced build the gate predictor is implemented. */
+	/* The gate predictor is implemented. */
 	taw_params g = {.predictor = TAW_PREDICTOR_GATE}, r;
 	CHECK(taw_params_resolve(&g, &r) == TAW_OK);
 	void *arc;
