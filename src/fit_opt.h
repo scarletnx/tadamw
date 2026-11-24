@@ -198,8 +198,8 @@ void malt_rows(const optcfg *o, float *w, float *m, float *l, float *r,
     float lr, float wd, float mix, bool adaptive,
     const opt_hooks *h, unsigned bid);
 
-/* No ns_score(): staged FARO @ 09311ce removed the routing lane it served.
- * If FARO ever restores TAW_FARO_STAT=lin, re-add it as a thin caller of
- * ns_ortho() rather than a fourth copy of the polynomial. */
+/* Linearized spectral return for FARO's TAW_FARO_STAT=lin lane: <g, NS(g)> /
+ * ||NS(g)||_F. A thin caller of ns_ortho(), so the polynomial has one home. */
+float ns_score(const optcfg *o, const float *g, unsigned rows, unsigned cols);
 
 #endif

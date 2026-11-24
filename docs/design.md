@@ -257,20 +257,27 @@ Unset means shipped behaviour; diagnostics print to stderr only.
 The knobs are grouped by feature. Each group states its byte-identity
 guarantee.
 
-### FARO-ERC allocation
+### FARO routing + ERC allocation
 
 | variable | default | effect |
 |----------|---------|--------|
-| `TAW_FARO=off\|on` | `off` | enables the ERC risk allocation lane |
-| `TAW_FARO_ALLOC=erc\|none` | `erc` | `none` disables reallocation (multiplier 1) |
+| `TAW_FARO` | `off` | `1`/`on`/`yes`/`true` enables FARO routing and ERC; unset/`0`/`off` is bit-exact base |
+| `TAW_FARO_ROUTE` | `ret` | W1 geometry: `ret` (measured return), `muon`, `adam` |
+| `TAW_FARO_STAT` | `probe` | `probe` (one-step counterfactual bits) or `lin` (linearized score via the shared NS polynomial) |
+| `TAW_FARO_EXPLORE` | `20` | post-untie batches used to measure returns before the route freezes |
+| `TAW_FARO_ALLOC` | `erc` | `none` disables reallocation (multiplier 1) |
 | `TAW_FARO_BLOCKS=set\|layer` | `set` | risk-block granularity |
 | `TAW_FARO_CAP`, `TAW_FARO_GAMMA`, `TAW_FARO_KAPPA`, `TAW_FARO_FLOOR`, `TAW_FARO_CEIL` | `1.4`, `0.9`, `3.0`, `0.5`, `2.0` | allocation cap, risk-EWMA decay, winsor bound, final clamp low/high |
 | `TAW_FARO_DEBUG` | unset | print freeze decisions and multiplier range to stderr |
 
-Only the ERC allocation lane is supported; the counterfactual routing
-experiment is not part of this surface. **Byte identity:** every FARO knob is
-inert until `TAW_FARO=on`; with it unset the shipped update expressions run
-verbatim.
+Both upstream lanes are kept: the routing lane compares the coordinate and
+spectral W1 updates on a deterministic in-batch probe and freezes after
+un-tie plus `TAW_FARO_EXPLORE` batches; the ERC lane reallocates the block
+LRs by winsorized, budget-neutral equal-risk contribution. Risk accounting
+is published through the shared `opt_hooks.risk` bank, and the `lin` lane uses
+the same `ns_ortho()` polynomial as Muon. **Byte identity:** every FARO knob
+is inert until `TAW_FARO` is enabled; with it unset the shipped update
+expressions run verbatim.
 
 **GPU guard:** FARO-ERC lives in the CPU fitter only (the Vulkan trainer has
 no risk/ERC hooks). With `TAW_FARO=on` and `-g on` or `-g auto`, fitting is

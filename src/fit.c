@@ -445,8 +445,8 @@ static unsigned fit_env_uint(const char *name, unsigned def)
 	return end != s ? (unsigned)v : def;
 }
 
-/* The optimizer wrappers (adam_rows, muon_rows, malt_rows) and the single
- * Newton-Schulz polynomial now live in fit_opt.c / fit_opt.h.
+/* The optimizer wrappers (adam_rows, muon_rows, malt_rows), ns_score() and
+ * the single Newton-Schulz polynomial now live in fit_opt.c / fit_opt.h.
  * Their FP expressions were moved verbatim; see tests/test_fit_opt.c. */
 
 static const char *fit_env_str(const char *name, const char *def)
@@ -576,61 +576,12 @@ static void faro_init(faro_ctx *f, const tnet *t, int epochs, size_t ns)
 }
 
 /* Linearized return of the spectral candidate on one W1 matrix: <g, NS(g)>
- * divided by ||NS(g)||_F. Duplicates Muon's Newton-Schulz loop (only used with
- * FARO enabled) so the shipped muon_rows stays byte-identical. */
-static float faro_ns_score(const optcfg *o, const float *g, unsigned rows,
-    unsigned cols)
+ * divided by ||NS(g)||_F. The NS polynomial is not duplicated here: FARO's
+ * TAW_FARO_STAT=lin lane calls the shared ns_score() in fit_opt.c. */
+static inline float faro_ns_score(const optcfg *o, const float *g,
+    unsigned rows, unsigned cols)
 {
-	float x[MUON_MAXEL], a[MUON_MAXEL], b[MUON_MAXEL], y[MUON_MAXEL];
-	const size_t n = (size_t)rows * cols;
-	if (n > MUON_MAXEL || !n)
-		return 0.0f;
-	const bool tr = rows > cols;
-	const size_t mr = tr ? cols : rows, mc = tr ? rows : cols;
-	for (size_t i = 0; i < n; i++) {
-		size_t at = tr ? (i % cols) * mc + i / cols : i;
-		x[at] = g[i];
-	}
-	float ss = 0.0f;
-	for (size_t i = 0; i < n; i++)
-		ss += x[i] * x[i];
-	if (!(ss > 1e-12f))
-		return 0.0f;
-	float inv = 1.0f / fsqrt(ss);
-	for (size_t i = 0; i < n; i++)
-		x[i] *= inv;
-	for (unsigned it = 0; it < o->ns_steps; it++) {
-		for (size_t i = 0; i < mr; i++)
-			for (size_t j = 0; j < mr; j++) {
-				float s = 0.0f;
-				for (size_t k = 0; k < mc; k++)
-					s += x[i * mc + k] * x[j * mc + k];
-				a[i * mr + j] = s;
-			}
-		for (size_t i = 0; i < mr; i++)
-			for (size_t j = 0; j < mr; j++) {
-				float s = 0.0f;
-				for (size_t k = 0; k < mr; k++)
-					s += a[i * mr + k] * a[k * mr + j];
-				b[i * mr + j] = -4.7750f * a[i * mr + j] + 2.0315f * s;
-			}
-		for (size_t i = 0; i < mr; i++)
-			for (size_t k = 0; k < mc; k++) {
-				float s = 0.0f;
-				for (size_t j = 0; j < mr; j++)
-					s += b[i * mr + j] * x[j * mc + k];
-				y[i * mc + k] = s;
-			}
-		for (size_t i = 0; i < n; i++)
-			x[i] = 3.4445f * x[i] + y[i];
-	}
-	double dot = 0.0, xn = 0.0;
-	for (size_t i = 0; i < n; i++) {
-		size_t at = tr ? (i % cols) * mc + i / cols : i;
-		dot += (double)g[i] * x[at];
-		xn += (double)x[at] * x[at];
-	}
-	return xn > 0.0 ? (float)(dot / (double)fsqrt((float)xn)) : 0.0f;
+	return ns_score(o, g, rows, cols);
 }
 
 /* Both scores are per-unit-update: ||g||_1/sqrt(N) is the RMS absolute

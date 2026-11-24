@@ -203,5 +203,34 @@ void malt_rows(const optcfg *o, float *w, float *m, float *l, float *r,
 	}
 }
 
-/* ns_score() removed: staged FARO @ 09311ce deleted the routing lane that
- * used TAW_FARO_STAT=lin. ns_ortho() remains the only polynomial. */
+/* FARO's TAW_FARO_STAT=lin linearized return. Upstream's copy repeated the
+ * NS loop; here it shares ns_ortho(), so the polynomial has one home. The
+ * normalization/contraction order is unchanged (verified byte-identical). */
+float ns_score(const optcfg *o, const float *g, unsigned rows, unsigned cols)
+{
+	float x[NS_MAXEL], a[NS_MAXEL], b[NS_MAXEL], y[NS_MAXEL];
+	const size_t n = (size_t)rows * cols;
+	if (n > NS_MAXEL || !n)
+		return 0.0f;
+	bool tr;
+	size_t mr, mc;
+	ns_geom(rows, cols, &tr, &mr, &mc);
+	for (size_t i = 0; i < n; i++)
+		x[ns_at(i, cols, tr, mc)] = g[i];
+	float ss = 0.0f;
+	for (size_t i = 0; i < n; i++)
+		ss += x[i] * x[i];
+	if (!(ss > 1e-12f))
+		return 0.0f;
+	float inv = 1.0f / fsqrt(ss);
+	for (size_t i = 0; i < n; i++)
+		x[i] *= inv;
+	ns_ortho(x, a, b, y, mr, mc, o->ns_steps);
+	double dot = 0.0, xn = 0.0;
+	for (size_t i = 0; i < n; i++) {
+		size_t at = ns_at(i, cols, tr, mc);
+		dot += (double)g[i] * x[at];
+		xn += (double)x[at] * x[at];
+	}
+	return xn > 0.0 ? (float)(dot / (double)fsqrt((float)xn)) : 0.0f;
+}
