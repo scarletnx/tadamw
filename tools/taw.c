@@ -20,7 +20,7 @@ static void usage(FILE *f)
 	fprintf(f,
 #if TAW_HAVE_ENCODER
 	    "usage: taw c [-l level] [-s] [-B block_size] [-p predictor] [-w weights]\n"
-	    "             [-j threads] [-g gpu] <in> <out>\n"
+	    "             [-j threads] [-g gpu] [-D [-T target] [-C change]] <in> <out>\n"
 #endif
 #if TAW_HAVE_DECODER
 	    "       taw d [-j threads] <in> <out>\n"
@@ -41,6 +41,11 @@ static void usage(FILE *f)
 	    "      -w auto|f16|q8|q4|q2|fp8|nvfp4|iq8|iq4|iq2\n"
 	    "                       mixer weight format (default auto)\n"
 	    "      -j N             worker threads (default 1)\n"
+	    "      -B N             .awseek nominal block size (power of two)\n"
+	    "      -D               dynamic blocks: boundaries at content changes\n"
+	    "                       (opt-in; needs -s or a .awseek output name)\n"
+	    "      -T N             target block bytes (default: -B)\n"
+	    "      -C N             change spike threshold 0..256 (0: ratio mode)\n"
 	    "      -g off|auto|on   fit on a GPU (default off; auto falls back to\n"
 	    "                       the CPU, on fails without a usable GPU)\n"
 	    "  d   decompress a .aw or .awseek archive\n"
@@ -196,6 +201,16 @@ static int cmd_compress(int argc, char **argv)
 		uint64_t v;
 		if (strcmp(argv[i], "-s") == 0) {
 			p.seekable = true;
+		} else if (strcmp(argv[i], "-D") == 0) {
+			p.dyn_blocks = true;
+		} else if (strcmp(argv[i], "-T") == 0 && i + 1 < argc &&
+		    parse_u64(argv[i + 1], &v) && v >= 1 && v <= (1u << 26)) {
+			p.chunk_target = (uint32_t)v;
+			i++;
+		} else if (strcmp(argv[i], "-C") == 0 && i + 1 < argc &&
+		    parse_u64(argv[i + 1], &v) && v <= 256) {
+			p.change_threshold = (uint32_t)v;
+			i++;
 		} else if (strcmp(argv[i], "-l") == 0 && i + 1 < argc &&
 		    parse_u64(argv[i + 1], &v) && v <= 9) {
 			p.level = (int)v;
@@ -402,8 +417,10 @@ static int cmd_info(int argc, char **argv)
 	    profile_name(info.arith_profile));
 	printf("quant:      %u (%s)\n", info.quant, quant_name(info.quant));
 	printf("level:      %u\n", info.level);
-	if (info.kind == TAW_KIND_SEEKABLE)
+	if (info.kind == TAW_KIND_SEEKABLE) {
 		printf("block_size: %" PRIu32 "\n", info.block_size);
+		printf("dynamic:    %s\n", info.has_dyn_blocks ? "yes" : "no");
+	}
 	printf("model_size: %" PRIu64 "\n", info.model_size);
 #if TAW_HAVE_DECODER
 	if (info.has_files && strcmp(argv[0], "-") != 0) {

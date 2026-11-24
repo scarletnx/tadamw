@@ -22,6 +22,9 @@ taw_test(gpu)
 taw_test(fitgolden)
 set_tests_properties(gpu PROPERTIES SKIP_RETURN_CODE 77)
 
+# Dynamic .awseek container tests.
+taw_test(dynfit)
+
 add_test(NAME cli_version COMMAND taw_cli --version)
 set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION "^taw [0-9]+\\.[0-9]+\\.[0-9]+")
 

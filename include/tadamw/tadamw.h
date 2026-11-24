@@ -118,6 +118,14 @@ typedef struct {
 	unsigned threads;    /* worker threads for .awseek (fitting and blocks);
 	                        0 = 1. The archive does not depend on it. */
 	taw_gpu_mode gpu;    /* fit on a GPU; default TAW_GPU_OFF */
+
+	/* Opt-in dynamic chunking for .awseek (docs/format.md §7.2). Off by
+	 * default: the default archive is byte-identical to a fixed-block one.
+	 * dyn_blocks puts block boundaries at content changes; block_size stays
+	 * a nominal target and the index stores each block's raw_len. */
+	bool dyn_blocks;
+	uint32_t chunk_target;   /* target block bytes; 0 = block_size */
+	uint32_t change_threshold; /* 0 = ratio mode, else byte surprise in 0..256 */
 } taw_params;
 
 /* ---- shared types --------------------------------------------------------- */
@@ -127,6 +135,7 @@ typedef enum { TAW_KIND_STREAM = 0, TAW_KIND_SEEKABLE = 1 } taw_kind;
 typedef struct {
 	taw_kind kind;
 	bool has_files;      /* .awseek with a file directory */
+	bool has_dyn_blocks; /* .awseek with variable-length blocks (§7.2) */
 	uint8_t arith_profile;
 	uint8_t quant;
 	uint8_t level;
