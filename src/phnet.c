@@ -11,7 +11,7 @@
 #include "taw_internal.h"
 
 /* o0 direct, o1 direct, word direct, match. The same four inputs are read by
- * the encoder's feature pass (fit.c), via phnet_boundary below. */
+ * the encoder's feature pass (fit.c), through phnet_boundary below. */
 static const uint8_t pick[PHNET_PICK_N] = {
 	P1_CM_O0, P1_CM_O1, P1_CM_WORD, P1_IN_MATCH
 };

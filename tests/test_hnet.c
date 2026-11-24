@@ -152,8 +152,8 @@ static void rows_and_loader(void)
 	taw_params resolved = {0};
 	CHECK(taw_params_resolve(&p6, &resolved) == TAW_OK);
 	CHECK(resolved.predictor == TAW_PREDICTOR_CALIBRATED);
-	/* Both are implemented in the coalesced build; a tiny input only
-	 * fails because no model fits the n/32 budget. */
+	/* Both are implemented; a tiny input only fails because no model
+	 * fits the n/32 budget. */
 	CHECK(taw_compress(tiny, sizeof tiny, &p6, &arc, &an) ==
 	    TAW_E_ARG);
 	taw_params p11 = {.predictor = TAW_PREDICTOR_GATE};

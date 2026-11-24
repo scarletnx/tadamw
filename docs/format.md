@@ -2,8 +2,8 @@
 
 Status: draft. Normative for profiles 0, 1 and the experimental profiles 6
 (`CALIBRATED_MIX`), 11 (`ENTROPY_GATE`) and 14 (`HNET_BOUNDARY`), and for the
-awseek variable-length-block container extension (§7.2); reserved and denied
-values are listed so that decoders can refuse them. `tests/test_p1.c` pins
+awseek variable-length-block container extension (§7.2); reserved values
+are listed so that decoders can refuse them. `tests/test_p1.c` pins
 profiles 1/6/11 and `tests/test_hnet.c` pins profile 14 with golden vectors:
 a change that breaks them changes the format.
 
@@ -466,7 +466,7 @@ o1 estimates, the direct word estimate and the match estimate of §2.2.3.
 A sample is taken once per byte, on the inputs of `bitpos = 7` (the last bit
 of a byte, just before the byte completes), **before** that bit is coded. The
 new value of `b` is used for that bit and is held until the next byte's
-`bitpos = 7`, i.e. through the first seven bits of the next byte. If `x[i]`
+`bitpos = 7`, that is, through the first seven bits of the next byte. If `x[i]`
 are the profile-1 inputs of that bit, the integer stretch values are
 `u[j] = x[P[j]] * 256`, which is exact (binary32 division and multiplication
 by a power of two: `x[i] = stretch[i]/256`).
