@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* PR #8: C3 sign gate. Direct gate math (foundation's single implementation)
+/* C3 sign gate. Direct gate math (foundation's single implementation)
  * plus fitted-model goldens. Knob-off must equal the CANONICAL base table.
  * Include the canonical harness FIRST: it defines _POSIX_C_SOURCE. */
 #include "fitgolden.h"
@@ -9,8 +9,7 @@ static float absf_(float x) { return x < 0.0f ? -x : x; }
 
 /* Measured on clang Release, x86-64, td_fill(TD_TEXT, 1234), 1 MiB. Tables
  * are assertions only; the canonical header has no print/bypass mode. */
-/* Tuned AdamW + shrink gate: the PR's winning arm (external bench golden
- * 180047 / 178687 / 372296 / 368712 is pinned in RESULTS.md). */
+/* Tuned AdamW + shrink gate. */
 static const fgold SHRINK[] = {
 	{1, TAW_WEIGHTS_F16, 262835, 1112, 0xE67FE8A4u},
 	{1, TAW_WEIGHTS_Q8, 262327, 608, 0xD5E7CF15u},

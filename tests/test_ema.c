@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* #19 arm target. Canonical harness: tests/fitgolden.h (no private copies).
+/* Canonical harness: tests/fitgolden.h (no private copies).
  * Pins default-off, explicit off, EMA(0.999)/SWA/EMA(0.9), the `late` gate,
  * MALTER default-off, MALTER+EMA, and GPU averaging exclusion. */
 #include "fitgolden.h"
@@ -28,8 +28,8 @@ static const fgold late_gold[] = {
 };
 #define LATE_N (sizeof late_gold / sizeof *late_gold)
 
-/* Absolute MALTER-path rows (auditor-measured on this branch: L5/Q8, GPU off,
- * no tuned LRs). Inequality checks alone let any byte-changing averaging bug
+/* Absolute MALTER-path rows (L5/Q8, GPU off, no tuned LRs).
+ * Inequality checks alone let any byte-changing averaging bug
  * pass; these pin the exact archive/model signature. */
 static const fgold malter_off[] = {
 	{5, TAW_WEIGHTS_Q8, 262754, 1912, 0xD7CD2BC4u},
@@ -53,7 +53,7 @@ static void expect_diff(const char *what, const fgold *a, const fgold *b)
 	}
 }
 
-/* I7: MALTER must be off by default (unset AND "off"), and averaging must
+/* MALTER must be off by default (unset AND "off"), and averaging must
  * still wrap the MALTER optimizer when asked. Previously only crc != crc
  * was asserted, so a MALTER default flip would have been invisible. */
 static void malt_ab(void)
@@ -108,7 +108,7 @@ static taw_status gpu_probe(int level, taw_gpu_mode gm, fgold *g,
 	return TAW_OK;
 }
 
-/* I7: GPU-trained candidates have no CPU trajectory, so TAW_FIT_AVG must be
+/* GPU-trained candidates have no CPU trajectory, so TAW_FIT_AVG must be
  * ignored for them. On a GPU-less host assert the complementary rule: AUTO
  * falls back to CPU and averaging applies (matches the CPU ema999 golden). */
 static void gpu_exclusion(void)

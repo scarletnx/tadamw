@@ -36,7 +36,7 @@ static const fgold namod[] = {
 	{5, TAW_WEIGHTS_F16, 261973,  568, 0xA331EA04u},
 	{5, TAW_WEIGHTS_Q8,  262830, 1912, 0x5744DC67u},
 };
-/* TAW_EPS_MODE=c3 aliases into the shared shrink gate; #8's output order. */
+/* TAW_EPS_MODE=c3 aliases into the shared shrink gate with the same output order. */
 static const fgold namo_gate[] = {
 	{1, TAW_WEIGHTS_F16, 263090, 1112, 0xE08B6854u},
 	{1, TAW_WEIGHTS_Q8,  262593,  608, 0xB4BA0916u},
@@ -61,7 +61,7 @@ int main(void)
 	fit_check("off", base_golden,
 	    sizeof base_golden / sizeof *base_golden);
 
-	/* P6-1 / I4: the shared gate and every NAMO knob are inert off-NAMO. */
+	/* The shared gate and every NAMO knob are inert off-NAMO. */
 	clear_knobs();
 	put("TAW_EPS_MODE", "c3");
 	put("TAW_EPS_GATE_P", "2");

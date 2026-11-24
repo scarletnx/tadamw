@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* PR #7 arm: the tuned AdamW control. Includes the CANONICAL fitgolden.h and
- * owns no baseline table or helpers (struct-d INTEGRATION.md, arm `tuned_lr`).
- * fitgolden.h must be included first: it defines _POSIX_C_SOURCE. */
+/* Tuned AdamW control. Includes the CANONICAL fitgolden.h and owns no
+ * baseline table or helpers. fitgolden.h must be included first: it defines
+ * _POSIX_C_SOURCE. */
 #include "fitgolden.h"
 
 /* TAW_LR0=0.055 TAW_LR1=0.00055 TAW_B1=0.95 TAW_B2=0.999 TAW_WD=1e-3 */

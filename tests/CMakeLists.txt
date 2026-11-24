@@ -42,7 +42,7 @@ add_test(NAME cli_fit_namo_seek
           -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_fit_namo_seek.cmake)
 set_tests_properties(cli_fit_namo_seek PROPERTIES ENVIRONMENT
   "TAW_HYBRID=namod;TAW_MUON_LR0=0.3;TAW_MUON_LR1=0.015;TAW_VEC_LR0=0.003;TAW_VEC_LR1=0.00015;TAW_NAMO_WD=0.01;TAW_NAMO_BETA=0.999;TAW_NAMO_CLAMP=0.9")
-# PR #7 LR-override arm.
+# LR-override arm.
 taw_test(tuned_lr)
 # C3 gate arm: gate math, knob-off equality, mean/shrink, layer/scope goldens.
 taw_test(c3_fit)
