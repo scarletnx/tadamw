@@ -15,7 +15,11 @@ taw_test(aw)
 taw_test(awseek)
 taw_test(p1)
 taw_test(quant)
+taw_test(fit_opt) # shared Newton-Schulz polynomial, bit-exactness oracle
 taw_test(gpu)
+# Fitted-model goldens: pin the fitter's own output, not just the hand-built
+# model arithmetic in test_p1.c. Reusable fit_check() lives in fitgolden.h.
+taw_test(fitgolden)
 set_tests_properties(gpu PROPERTIES SKIP_RETURN_CODE 77)
 
 add_test(NAME cli_version COMMAND taw_cli --version)
@@ -26,6 +30,13 @@ add_test(NAME cli_roundtrip
                  "-DSOURCES=${PROJECT_SOURCE_DIR}/docs/format.md|${PROJECT_SOURCE_DIR}/docs/design.md"
                  -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli_work
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_roundtrip.cmake)
+
+# Knob-off archive bytes + the seven optimizer profiles, recorded from main.
+add_test(NAME cli_fit_golden
+         COMMAND ${CMAKE_COMMAND} -DTAW=$<TARGET_FILE:taw_cli>
+                 -DDOCS=${PROJECT_SOURCE_DIR}/docs
+                 -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cli_fit_golden_work
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_fit_golden.cmake)
 
 # taw-nx (built only with OpenSSL and LZ4): synthetic keys and NSP, no real
 # dumps or keys needed.

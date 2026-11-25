@@ -27,7 +27,7 @@ set(tadamw_sources
   api.c aw.c awseek.c buf.c crc32c.c header.c p1_ctx.c p1_net.c pool.c
   predictor.c quant.c rc.c version.c)
 if(TADAMW_ENCODER)
-  list(APPEND tadamw_sources fit.c fit_gpu.c) # AdamW fitting, encoder only
+  list(APPEND tadamw_sources fit.c fit_opt.c fit_gpu.c) # AdamW fitting, encoder only
 endif()
 if(TAW_HAVE_GPU)
   # The trainer's compute shader, as SPIR-V words in a header.

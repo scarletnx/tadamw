@@ -243,6 +243,132 @@ stderr, whether the GPU was used (or why not) and the fitting time;
 `TAW_FIT_DEBUG=a` fits all candidates (slow; that is how the prior was
 calibrated).
 
+## Environment knobs (encoder-only)
+
+Every knob that can change fitted weights defaults to the shipped setting.
+With none of the variables below set — and with the `auto`/`mix` predictors —
+the encoder reproduces the shipped archives byte for byte at every level on
+all golden corpora. `auto`/`mix` and the shipped optimizer are never changed
+by an environment variable. All `TAW_*` overrides are read by the encoder
+only: they are tuning hooks, not CLI options or API fields, they do not
+change the archive format, and they never affect decoding or random access.
+Unset means shipped behaviour; diagnostics print to stderr only.
+
+The knobs are grouped by feature. Each group states its byte-identity
+guarantee.
+
+### FARO routing + ERC allocation
+
+| variable | default | effect |
+|----------|---------|--------|
+| `TAW_FARO` | `off` | `1`/`on`/`yes`/`true` enables FARO routing and ERC; unset/`0`/`off` is bit-exact base |
+| `TAW_FARO_ROUTE` | `ret` | W1 geometry: `ret` (measured return), `muon`, `adam` |
+| `TAW_FARO_STAT` | `probe` | `probe` (one-step counterfactual bits) or `lin` (linearized score with the shared NS polynomial) |
+| `TAW_FARO_EXPLORE` | `20` | post-untie batches used to measure returns before the route freezes |
+| `TAW_FARO_ALLOC` | `erc` | `none` disables reallocation (multiplier 1) |
+| `TAW_FARO_BLOCKS=set\|layer` | `set` | risk-block granularity |
+| `TAW_FARO_CAP`, `TAW_FARO_GAMMA`, `TAW_FARO_KAPPA`, `TAW_FARO_FLOOR`, `TAW_FARO_CEIL` | `1.4`, `0.9`, `3.0`, `0.5`, `2.0` | allocation cap, risk-EWMA decay, winsor bound, final clamp low/high |
+| `TAW_FARO_DEBUG` | unset | print freeze decisions and multiplier range to stderr |
+
+Both upstream lanes are kept: the routing lane compares the coordinate and
+spectral W1 updates on a deterministic in-batch probe and freezes after
+un-tie plus `TAW_FARO_EXPLORE` batches; the ERC lane reallocates the block
+LRs by winsorized, budget-neutral equal-risk contribution. Risk accounting
+is published through the shared `opt_hooks.risk` bank, and the `lin` lane uses
+the same `ns_ortho()` polynomial as Muon. **Byte identity:** every FARO knob
+is inert until `TAW_FARO` is enabled; with it unset the shipped update
+expressions run verbatim.
+
+**GPU guard:** FARO-ERC lives in the CPU fitter only (the Vulkan trainer has
+no risk/ERC hooks). With `TAW_FARO=on` and `-g on` or `-g auto`, fitting is
+forced onto the CPU (`TAW_GPU_OFF`) so the archive cannot depend on the
+machine's Vulkan device. Unlike the C3 guard below, this is a silent
+downgrade, not an error.
+
+### NAMO / NAMO-D
+
+| variable | default | effect |
+|----------|---------|--------|
+| `TAW_HYBRID=namo\|namod` | `adam` | W1 optimizer: `namo` scalar adaptive scale, `namod` clamped right-diagonal scale |
+| `TAW_NAMO_BETA` | `0.99` | second-moment decay for the adaptive scale |
+| `TAW_NAMO_SCALE` | `1.0` | multiplier of the adaptive W1 step |
+| `TAW_NAMO_CLAMP` | `0.1` | NAMO-D clamp; `0` disables it |
+| `TAW_NAMO_WD` | `1e-3` | adaptive-scaled W1 weight decay |
+| `TAW_NAMO_D_AXIS=col\|row` | `col` | right-diagonal (default) or row-wise ablation |
+| `TAW_NAMO_NEST` | `0` | Nesterov momentum for the NAMO W1 update |
+
+`TAW_MALT`/`TAW_MALTER` take precedence over `TAW_HYBRID`; leave them unset
+when selecting a NAMO mode. `TAW_NAMO_NEST` is the NAMO-only Nesterov switch
+(default `0`, the paper's un-extrapolated momentum); the shared
+`TAW_MUON_NEST` keeps its shipped default of `1` in every mode, so no shared
+knob changes meaning under NAMO. Sign gating has one owner, `TAW_EPS_MODE=c3`
+below; NAMO exposes no private gate knob.
+**Byte identity:** all of the above are inert at the default
+`TAW_HYBRID=adam`.
+
+### Flat learning rate
+
+`TAW_LR1=flat` holds the learning rate at `TAW_LR0` instead of decaying to
+`TAW_LR0/20`; a numeric `TAW_LR1` keeps the shipped schedule. **Byte
+identity:** with `TAW_LR1` unset (or numeric) the archive is unchanged.
+
+### Epsilon / sign gate
+
+| variable | default | effect |
+|----------|---------|--------|
+| `TAW_EPS_MODE=none\|c3` | `none` | sign-EMA shrink gate on AdamW vector updates |
+| `TAW_EPS_SIGN_BETA` | `0.9` | sign-EMA decay |
+| `TAW_EPS_GATE_P` | `1.0` | gate exponent |
+| `TAW_EPS_GATE_MODE=mean\|shrink` | `mean` | mean-preserving or shrink-only gate |
+| `TAW_EPS_LAYERS=1\|2\|12` | `2` | layer bitmask (1 = AdamW path, 2 = layer 2) |
+| `TAW_EPS_SCOPE=all\|cold\|warm` | `all` | touch-count stratification |
+| `TAW_EPS_DEBUG` | unset | print per-layer gating statistics to stderr |
+
+This is the single owner of the sign gate; it wraps only AdamW `(m, v)`
+vector updates and leaves the Muon and MALT/MALTER W1 paths untouched.
+**Byte identity:** with `TAW_EPS_MODE` unset (or `none`) every update is the
+shipped one.
+
+**GPU guard:** the gate is implemented in the CPU fitter only.
+`TAW_EPS_MODE=c3` with `-g on` or `-g auto` is rejected with `TAW_E_ARG`
+("invalid argument") rather than silently training GPU candidates with plain
+AdamW. Set `-g off` when using the gate.
+
+### Model averaging
+
+`TAW_FIT_AVG=off|late|swa|ema9|ema95|ema99|ema999|swa_all` (default `off`;
+numeric aliases `0..7` and `ema09` are also accepted) folds averaged weights
+into the fitted model. `late` is EMA(0.999) only for runs of at least six
+epochs (levels 3+); levels 1-2 keep the last iterate.
+**Byte identity:** the default is `off`, so with the variable unset every
+archive — including MALTER/Muon runs — is identical to the shipped one.
+`late` is opt-in through the environment only, and GPU warm-start nets are not
+averaged.
+
+### Predictor choices: gate and hnet
+
+`taw c -p gate` selects the entropy-adaptive confidence gate (predictor 11,
+arithmetic profile 11); `taw c -p hnet` selects the integer H-Net boundary
+input (predictor 14, arithmetic profile 14). These map to
+`TAW_PREDICTOR_GATE` and `TAW_PREDICTOR_HNET`; `-p gate` and `-p hnet` are
+their CLI token names. Other arithmetic profiles remain reserved and are
+refused by the loader (docs/format.md §2). The default `auto`/`mix` path
+stays byte-identical.
+
+### Calibrated mixer (profile 6)
+
+`TAW_CALIBRATED=0|1|on|cal` (default `0`, that is, off; `1`, `on` and `cal` enable)
+opts the fitter into profile 6 (`CALIBRATED_MIX`), which stores eight bytes of
+fitted temperature/bias/weight parameters in the archive. Predictor value 6
+is `TAW_PREDICTOR_CALIBRATED` with the `-p cal` CLI token; `auto`/`mix` still
+fit profile 1 only.
+The test suite also reads `TAW_CAL_PARAMS=temp,bias,w0,w1,w2` and
+`TAW_CAL_NO_APM=1` as ablation overrides (encoder-only, unset by default);
+they are not product knobs. Profile 6 candidates fit on the CPU even with
+`-g on`/`-g auto`, to keep the held-out-sample path.
+**Byte identity:** with `TAW_CALIBRATED` unset (or `0`) every archive is the
+shipped profile-1 result.
+
 ## GPU fitting
 
 `src/fit_gpu.c` drives two compute shaders through Vulkan 1.1, which it
@@ -387,6 +513,13 @@ Each decoding thread holds its own tables (about 175 MB for 1 MiB
 blocks), whole blocks are decoded straight into the caller's buffer and
 the partial ones at the edges through a per-thread buffer. The source's
 `read_at` must then be thread safe (`pread` is).
+
+`.awseek` dynamic blocks are opt-in through `-D` (`-T` sets the target block
+bytes and `-C` the change spike threshold, 0 = ratio mode); the default
+archive is byte-identical to fixed blocks and `taw i` reports `dynamic:`.
+The matching public API fields are `taw_params.dyn_blocks`,
+`taw_params.chunk_target`, `taw_params.change_threshold` and
+`taw_info.has_dyn_blocks`.
 
 ## Source layout
 

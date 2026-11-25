@@ -16,6 +16,52 @@ Two variants share one header and one model section:
 | `.aw`     | 0    | stream: chunks are decoded strictly in order |
 | `.awseek` | 1    | seekable: independent fixed-size blocks + seek index |
 
+## Allocation registry
+
+This table is the authority for arithmetic-profile IDs and awseek flag bits.
+Section numbers follow the rule *section number = profile ID*; profiles
+0 and 1 are fixed at §2.1/§2.2 and §5.1.
+
+| id / bit | name | canonical section(s) | status on this base |
+|----------|------|----------------------|---------------------|
+| profile 0 | `INT_ORDER0` | §2.1, §5 (intro note) | implemented |
+| profile 1 | `F32_STRICT_MIX` | §2.2, §5.1 | implemented, golden-pinned |
+| profile 6 | `CALIBRATED_MIX` | §2.6, §5.6 | reserved; decoder refuses |
+| profile 11 | `ENTROPY_GATE` | §2.11, §5.11 | reserved; decoder refuses |
+| profile 14 | `HNET_BOUNDARY` | §2.14, §5.14 | reserved; decoder refuses |
+| awseek flag bit 1 | variable-length blocks (container only) | §7.2 | reserved; decoder refuses |
+| profile 3, 7 | `SOFT_GATED`, `SOFT_GATED_CAL` | — | reserved; decoder refuses |
+| profile 8 | `PAQ_MIX` | — | reserved; decoder refuses |
+| profile 10 | `F32_CHAINED_MIX` | — | reserved; decoder refuses |
+| profile 12 | `MDL_TREE` | — | reserved; decoder refuses |
+
+Reserved IDs are refused by decoders. No quant ID is added here: quant ids
+`5..11` (`Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4`, `IQ2`) stay exactly as
+specified in §3, and every retained profile uses the profile-1 quant set.
+§2.3 and §5.2 are sealed (see below).
+
+### Predictor enum (`taw_predictor`, API only)
+
+The public `taw_predictor` selector is an encoder-side choice and is **not**
+stored in an archive: header bytes 6 and 7 carry `arith_profile` and `quant`.
+Predictor values do not change the arithmetic-profile table above, which
+remains the sole authority for profile IDs.
+
+| value | enum name | profile | status |
+|-------|-----------|---------|--------|
+| 0 | `TAW_PREDICTOR_AUTO` | — | original value |
+| 1 | `TAW_PREDICTOR_ORDER0` | 0 | legacy value |
+| 2 | `TAW_PREDICTOR_MIX` | 1 | legacy value |
+| 6 | `TAW_PREDICTOR_CALIBRATED` | 6 | allocated |
+| 11 | `TAW_PREDICTOR_GATE` | 11 | allocated |
+| 14 | `TAW_PREDICTOR_HNET` | 14 | allocated |
+
+Values `3..5`, `7..10`, `12..13` and `15..255` are refused:
+`taw_params_resolve()` returns `TAW_E_ARG` and the CLI offers no name for
+them. Value 11 is the only allocated value in the nominal `7..13` range,
+because predictor values equal their profile IDs. Value 3 is **void**. No
+predictor value is assigned to the reserved profile IDs 3, 7, 8, 10 or 12.
+
 ## 1. File header (32 bytes)
 
 | off | size | field          | notes |
@@ -41,6 +87,9 @@ fall back to a different arithmetic: an archive decodes exactly or not at all.
 
 For awseek, `block_size` MUST be a power of two in `[2^12, 2^30]`.
 
+Flag bit 1 is reserved for the container-only extension in §7.2; a decoder on
+this base refuses it as an unsupported flag.
+
 ## 2. Arithmetic profiles
 
 The profile fixes how the decoder turns model weights and history into
@@ -52,7 +101,15 @@ identical probabilities for every bit.
 |----|-----------------|---------------|--------|
 | 0  | `INT_ORDER0`    | empty (`model_size = 0`, `quant = 0`) | implemented, placeholder |
 | 1  | `F32_STRICT_MIX`| mixer shape and weights, §5.1; quant `F16`, `Q8`, `Q4`, `Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4` or `IQ2` | implemented |
-| 2..255 | — | — | reserved, refuse |
+| 6  | `CALIBRATED_MIX` | §5.6 | reserved; decoder refuses |
+| 11 | `ENTROPY_GATE` | §5.11 | reserved; decoder refuses |
+| 14 | `HNET_BOUNDARY` | §5.14 | reserved; decoder refuses |
+| 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 15..255 | — | — | reserved: refuse |
+
+This is the only profile table. IDs `6`, `11` and `14` are named in the
+allocation registry but are not implemented on this base, so a decoder here
+refuses them. IDs `3`, `7`, `8`, `10` and `12` are reserved (see the allocation
+registry) and MUST NOT be treated as free. §2.3 and §5.2 are sealed.
 
 ### 2.1 Profile 0: `INT_ORDER0`
 
@@ -306,10 +363,37 @@ and the same `A2` entry are updated: `e += (65535 - e) >> 6` if `b`, else
    `nib = 1` and select lines with `q = c0`. At `bitpos` 8: byte end
    (§2.2.5).
 
+### 2.3 (sealed — profile-1-only)
+
+This subsection number is sealed. It is reserved for profile-1 material only
+and MUST NOT be used to document any other arithmetic profile. Other profiles
+use §2.6, §2.11 and §2.14.
+
+### 2.6 Profile 6: `CALIBRATED_MIX`
+
+Reserved; `arith_profile = 6` is refused. Predictor slot
+`TAW_PREDICTOR_CALIBRATED = 6` uses the CLI token `-p cal`.
+
+### 2.11 Profile 11: `ENTROPY_GATE`
+
+Reserved; `arith_profile = 11` is refused. Predictor slot
+`TAW_PREDICTOR_GATE = 11` uses the CLI token `-p gate`.
+
+### 2.14 Profile 14: `HNET_BOUNDARY`
+
+Reserved; `arith_profile = 14` is refused. Predictor slot
+`TAW_PREDICTOR_HNET = 14` uses the CLI token `-p hnet`. Value 3 is void, and
+`3..5`, `7..10` and `12..13` are refused (see the predictor enum above).
+
 ## 3. Quantization formats
 
 The format in which model weights are stored. Encoders may pick any format
 the profile allows. F16 is the standard format.
+
+Allocation note: no quant ID is added by the registry. Ids `5..11` (`Q4`,
+`Q2`, `FP8`, `NVFP4`, `IQ8`, `IQ4`, `IQ2`) and their encodings below are
+unchanged on this base, and every retained profile uses the profile-1 quant
+set (`F16` plus `Q8`..`IQ2`). Quant ids `12..255` stay reserved, refuse.
 
 | id | name | encoding |
 |----|------|----------|
@@ -443,6 +527,25 @@ A decoder needs about `10 * 2^L * 64 + 2^HB + 4 * 2^MB` bytes of tables
 plus about 4.6 MB fixed (o1 table and APM), and resets them per coding
 unit.
 
+### 5.2 (sealed — profile-1-only)
+
+This subsection number is sealed and reserved for profile-1 material; it
+MUST NOT be used for any other profile's model section. Other profiles use
+§5.6, §5.11 and §5.14.
+
+### 5.6 Profile 6 model
+
+Reserved; a profile-6 model is refused on this base.
+
+### 5.11 Profile 11 model
+
+Reserved; a profile-11 model is refused on this base.
+
+### 5.14 Profile 14 model
+
+Reserved; a profile-14 model is refused on this base. It reuses the §5.1 head
+and row encodings with row width 27 instead of 26.
+
 ## 6. aw body (kind 0)
 
 A sequence of chunks follows the model section:
@@ -491,6 +594,11 @@ Index:
 the entries are followed by the file directory (§7.1), still inside the index
 and covered by `index_crc`.
 
+The 16-byte entry above is the normative version-1 layout. A 20-byte entry
+adding `u32 raw_len` behind awseek flag bit 1 (§7.2) is a reserved extension,
+not part of this document: a decoder on this base MUST refuse flag bit 1
+rather than parse such an index.
+
 Footer (the last 16 bytes of the file):
 
 | size | field |
@@ -522,3 +630,9 @@ Rules (a decoder MUST refuse a directory that breaks one):
 - The directory must end exactly where the footer starts.
 
 Bytes outside every file are allowed but carry no name.
+
+### 7.2 Variable-length blocks
+
+Reserved container-only extension: awseek flag bit 1 and 20-byte index entries
+carrying `raw_len`. It is not normative on this base; the flag remains
+refused and the index remains 16-byte (§7).
